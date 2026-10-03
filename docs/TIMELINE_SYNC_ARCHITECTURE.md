@@ -333,12 +333,15 @@ Phase 5 では Provider + content ID + comment source ID / revision + schema / a
 
 Phase 0 を独立レビューした後、**Phase 1 だけ**を別 branch / Draft PR で行う。
 
-1. Netflix で Global を入力・適用して再現ログを取る。reset reason、Provider / content identity、instance generation、video 交換、metadata、visibility、offset 前後を最小限記録する。
-2. loadedmetadata clear と visibility dispose のどちらが実発生するか確定する。背景 cleanup、旧 callback 競合、pause中の見かけのずれを切り分ける。
-3. Provider + content ID と instance generation の責務を定義し、同一 episode と確定した別 episode を区別する。取得失敗を別 episode 判定にしない。
-4. 必要な経路だけを最小修正し、State保持 / Renderer再適用 / port cleanup の整合性を取る。CLEAR_KEYS の変更だけで済ませない。
-5. 同一 episode metadata反復、video交換、非表示→表示、別episode、遅延metadata / 旧port、明示reset、marker、reload、seek / pause / rate を回帰確認する。mock結果と実機結果を分ける。
-6. typecheck / 非書込みlint / Chrome・Firefox buildを実行し、失敗・未確認を明記して Draft PR / review_pack を提出する。自動Timeline Sync実装はPhase 2以降へ残す。
+認証済み Netflix を Codex が自律操作できる前提にはしない。**実機の再生操作・再現・ログ取得はユーザー**が担当し、**診断ログの実装、build、提供ログの解析、必要な修正、自動検証は Codex** が担当する。
+
+1. Codex が既存挙動を維持した最小限の診断ログを実装する。reset reason、Provider / content identity、instance generation、video 交換、metadata、visibility、offset 前後を記録し、reset 経路を追跡できるようにする。この段階では原因候補を確定扱いせず、offset 保持の動作変更は行わない。
+2. Codex が診断版の typecheck / 非書込み lint / Chrome・Firefox build を実行し、Chrome 用成果物と再現・ログ取得手順をユーザーへ渡す。build が成立しない場合は制約と失敗を明記し、実機検証済みとはしない。
+3. ユーザーが Chrome に診断版を読み込み、ログイン済み Netflix で Global を入力・適用して消失を再現し、診断ログを取得して Codex へ提供する。
+4. Codex が提供された実機ログを解析し、loadedmetadata clear と visibility dispose のどちらが実発生したかを確定する。背景 cleanup、旧 callback 競合、pause 中の見かけのずれも切り分ける。**実機ログを取得できていない場合、またはログが不足する場合は原因確定・修正完了扱いにせず**、原因候補と不足する観測を記録して、追加ログの取得手順を示す。
+5. 原因確定後、Codex が Provider + content ID と instance generation の責務を定義し、必要な経路だけを最小修正する。同一 episode と確定した別 episode を区別し、取得失敗を別 episode 判定にしない。State 保持 / Renderer の初期値読込み・再適用 / port cleanup の整合性を取り、CLEAR_KEYS の変更だけで済ませない。
+6. Codex が同一 episode の metadata 反復、video 交換、非表示→表示、別 episode、遅延 metadata / 旧 port、明示 reset、marker、reload、seek / pause / rate の自動回帰検証と、修正版の typecheck / 非書込み lint / Chrome・Firefox build を行う。ユーザーは修正版で実機の再現・回帰確認とログ取得を担当し、そのログを Codex が解析する。mock の結果と実機の結果を区別し、実機での解消を未確認のまま修正完了とはしない。
+7. Codex が診断・原因確定・修正・自動検証とユーザーの実機確認結果を、失敗・未確認を含め Draft PR / review_pack に記録する。**Phase 1 で停止し、自動 Timeline Sync の実装や Phase 2 以降へは進まない。**
 
 ## 根拠リンク（調査基準固定）
 

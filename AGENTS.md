@@ -31,8 +31,3 @@
 - 完了時に branch、commit SHA、Draft PR URL、変更ファイル、主要結論、未確認事項、次工程案を報告する。
 - コード、UI、設定の実変更時は原則 `review_pack/REVIEW.md` と `review_pack/changes.diff` を作る。要求、変更内容とファイル、主要箇所、検証結果、既知問題、独立レビューの重点を記載し、Git diff と照合可能な根拠を優先する。
 - UI 変更時は可能なら変更後のスクリーンショットを添える。調査のみ、回答のみ、変更なし、ごく軽微な変更は review_pack を省略できる。資料のために本実装を複雑化しない。
-
-## Current phase
-
-Phase 0 は `AGENTS.md` と調査文書のみ。既存ソースの動作変更は禁止。
-`docs/TIMELINE_SYNC_ARCHITECTURE.md` と Draft PR を完成させ、レビュー待ちで停止する。
