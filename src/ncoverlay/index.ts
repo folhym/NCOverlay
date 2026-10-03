@@ -1,4 +1,8 @@
 import type { MarkerKey } from '@/constants/markers'
+import type {
+  OffsetDiagnosticFields,
+  OffsetDiagnostics,
+} from '@/utils/offsetDiagnostics'
 import type { Browser } from '@/utils/webext'
 import type { NCOPatcherFunctions } from './patcher'
 
@@ -37,9 +41,12 @@ export class NCOverlay {
   readonly searcher: NCOSearcher
   readonly renderer: NCORenderer
   readonly keyboard: NCOKeyboard
+  readonly diagnostics?: OffsetDiagnostics
 
   readonly #removeListenerCallbacks: (() => void)[] = []
   readonly #port: Browser.runtime.Port
+  readonly #diagnosticVideoObserver?: MutationObserver
+  #diagnosticStateOffset: number | null | undefined = undefined
 
   get video() {
     return this.renderer.video
@@ -51,17 +58,20 @@ export class NCOverlay {
   constructor(
     tabId: number,
     video: HTMLVideoElement,
-    functions?: NCOPatcherFunctions
+    functions?: NCOPatcherFunctions,
+    diagnostics?: OffsetDiagnostics
   ) {
     logger.log('new NCOverlay()')
 
     this.id = tabId
-    this.state = new NCOState(this.id)
+    this.diagnostics = diagnostics
+    this.state = new NCOState(this.id, this.diagnostics?.log)
     this.searcher = new NCOSearcher(this.state)
-    this.renderer = new NCORenderer(video, functions)
+    this.renderer = new NCORenderer(video, functions, this.diagnostics?.log)
     this.keyboard = new NCOKeyboard(this.state, {
       jumpMarker: (...args) => this.jumpMarker(...args),
     })
+    this.diagnostics?.log('overlay.create', this.#getDiagnosticFields())
 
     this.#port = webext.runtime.connect({ name: 'instance' })
     this.#port.onMessage.addListener((message) => {
@@ -69,6 +79,29 @@ export class NCOverlay {
         this.#port.postMessage(`pong:${this.id}`)
       }
     })
+    if (this.diagnostics) {
+      try {
+        this.#port.postMessage({
+          type: 'offset-diagnostics',
+          provider: this.diagnostics.provider,
+          generation: this.diagnostics.generation,
+        })
+      } catch {
+        this.diagnostics.log('overlay.diagnostics-port.failed')
+      }
+
+      try {
+        this.#diagnosticVideoObserver = new MutationObserver(() => {
+          this.diagnostics?.log('video.src.attribute-changed')
+        })
+        this.#diagnosticVideoObserver.observe(video, {
+          attributes: true,
+          attributeFilter: ['src'],
+        })
+      } catch {
+        this.diagnostics.log('video.src-observer.failed', { phase: 'observe' })
+      }
+    }
 
     this.#registerEventListener()
 
@@ -77,6 +110,13 @@ export class NCOverlay {
     // 既にメタデータ読み込み済みの場合
     if (HTMLMediaElement.HAVE_METADATA <= this.video.readyState) {
       setTimeout(() => {
+        if (this.diagnostics) {
+          this.diagnostics.metadataSource = 'synthetic'
+          this.diagnostics.log('video.loadedmetadata', {
+            metadataSource: 'synthetic',
+            scheduledDelayMs: 100,
+          })
+        }
         this.#trigger('loadedmetadata')
       }, 100)
     }
@@ -84,26 +124,55 @@ export class NCOverlay {
 
   async dispose() {
     logger.log('NCOverlay.dispose()')
+    this.diagnostics?.log('overlay.dispose.begin', this.#getDiagnosticFields())
+    try {
+      this.#diagnosticVideoObserver?.disconnect()
+    } catch {
+      this.diagnostics?.log('video.src-observer.failed', {
+        phase: 'disconnect',
+      })
+    }
 
     await this.state.dispose()
     this.renderer.dispose()
     this.keyboard.dispose()
+    this.diagnostics?.log(
+      'overlay.dispose.teardown',
+      this.#getDiagnosticFields()
+    )
 
+    this.diagnostics?.log('overlay.port-disconnect')
     this.#port.disconnect()
 
     this.#unregisterEventListener()
     this.removeAllEventListeners()
 
     await sendExtensionMessage('bg:setBadge', { text: null })
+    this.diagnostics?.log('overlay.dispose.end', this.#getDiagnosticFields())
   }
 
   async clear() {
     logger.log('NCOverlay.clear()')
+    this.diagnostics?.log('overlay.clear.begin', this.#getDiagnosticFields())
 
     await this.state.clear()
     this.renderer.clear()
+    this.diagnostics?.log('overlay.clear.reset', this.#getDiagnosticFields())
 
     await sendExtensionMessage('bg:setBadge', { text: null })
+    this.diagnostics?.log('overlay.clear.end', this.#getDiagnosticFields())
+  }
+
+  #getDiagnosticFields(): OffsetDiagnosticFields {
+    return {
+      ...this.renderer.getDiagnosticSnapshot(),
+      stateOffsetKnown: this.#diagnosticStateOffset !== undefined,
+      stateOffsetSeconds: this.#diagnosticStateOffset,
+      stateOffsetObservation:
+        this.#diagnosticStateOffset === undefined
+          ? 'unknown'
+          : 'storage-on-change',
+    }
   }
 
   /**
@@ -171,23 +240,32 @@ export class NCOverlay {
   } = {
     loadedmetadata: () => {
       logger.log('event', 'loadedmetadata')
+      if (this.diagnostics) {
+        this.diagnostics.metadataSource = 'native'
+        this.diagnostics.log('video.loadedmetadata', {
+          metadataSource: 'native',
+        })
+      }
 
       this.#trigger('loadedmetadata')
     },
 
     playing: () => {
+      this.diagnostics?.log('video.playing', this.#getDiagnosticFields())
       this.renderer.start()
 
       this.#trigger('playing')
     },
 
     pause: () => {
+      this.diagnostics?.log('video.pause', this.#getDiagnosticFields())
       this.renderer.stop()
 
       this.#trigger('pause')
     },
 
     seeked: () => {
+      this.diagnostics?.log('video.seeked', this.#getDiagnosticFields())
       this.renderer.rerender()
 
       this.#trigger('seeked')
@@ -198,6 +276,7 @@ export class NCOverlay {
     },
 
     ratechange: () => {
+      this.diagnostics?.log('video.ratechange', this.#getDiagnosticFields())
       this.renderer.updateTime()
     },
   }
@@ -250,7 +329,15 @@ export class NCOverlay {
       }),
 
       // 全体のオフセット
-      this.state.onChange('offset', (offset) => {
+      this.state.onChange('offset', (offset, oldOffset) => {
+        if (this.diagnostics) {
+          this.#diagnosticStateOffset = offset
+          this.diagnostics.log('state.offset.changed', {
+            ...this.#getDiagnosticFields(),
+            oldOffsetSeconds: oldOffset,
+            newOffsetSeconds: offset,
+          })
+        }
         this.renderer.setOffset(offset ?? 0)
       }),
 

@@ -7,6 +7,7 @@ import type {
   VideoChapter,
 } from '@/utils/api/jikkyo/findChapters'
 import type { JikkyoMarker } from '@/utils/api/jikkyo/findMarkers'
+import type { OffsetDiagnosticLogger } from '@/utils/offsetDiagnostics'
 import type { StorageOnChangeCallback } from '@/utils/storage'
 import type { NCOSearcherAutoSearchArgs } from './searcher'
 
@@ -19,6 +20,7 @@ import {
 } from '@/constants'
 import { deepmerge } from '@/utils/deepmerge'
 import { logger } from '@/utils/logger'
+import { emitOffsetDiagnostic } from '@/utils/offsetDiagnostics'
 import { filterThreadsByJikkyoChapters } from '@/utils/api/jikkyo/findChapters'
 import {
   isNgComment,
@@ -452,9 +454,13 @@ export async function filterDisplayThreads(
  */
 export class NCOState {
   readonly id: number
+  readonly #diagnosticLog: OffsetDiagnosticLogger
 
-  constructor(id: number) {
+  constructor(id: number, diagnosticLog?: OffsetDiagnosticLogger) {
     this.id = id
+    this.#diagnosticLog =
+      diagnosticLog ??
+      ((event, fields) => emitOffsetDiagnostic(event, { tabId: id, ...fields }))
   }
 
   async dispose() {
@@ -491,6 +497,12 @@ export class NCOState {
   }
 
   set<K extends NCOStateItemKey>(key: K, value: NCOStateItem<K>) {
+    if (key === 'offset') {
+      this.#diagnosticLog('state.offset.set', {
+        requestedOffsetSeconds: typeof value === 'number' ? value : null,
+        operation: value == null ? 'remove' : 'set',
+      })
+    }
     return storage.set(`state:${this.id}:${key}`, value as any)
   }
 
@@ -581,6 +593,9 @@ export class NCOState {
         }
       }
     } else {
+      if (key === 'offset') {
+        this.#diagnosticLog('state.offset.remove')
+      }
       return storage.remove(`state:${this.id}:${key}`)
     }
   }
