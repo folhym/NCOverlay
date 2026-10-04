@@ -1,5 +1,11 @@
+import type { OffsetDiagnosticFields } from '@/utils/offsetDiagnostics'
+import type { OffsetUiOperation } from '@/utils/offsetUiDiagnostics'
+
+import { useEffect, useRef, useState } from 'react'
 import { Button, ButtonGroup, Divider, Input, cn } from '@heroui/react'
 import { CheckIcon, RotateCcwIcon } from 'lucide-react'
+
+import { createOffsetUiDiagnostics } from '@/utils/offsetUiDiagnostics'
 
 export interface OffsetControlProps {
   value: number
@@ -7,6 +13,11 @@ export interface OffsetControlProps {
   compact?: boolean
   onValueChange: (value: number) => void
   onApply: () => void
+  diagnosticContext?: OffsetDiagnosticFields
+  onDiagnosticOperation?: (
+    operation: OffsetUiOperation,
+    fields: OffsetDiagnosticFields
+  ) => void
 }
 
 export function OffsetControl({
@@ -15,13 +26,68 @@ export function OffsetControl({
   onApply,
   isValueChanged,
   compact,
+  diagnosticContext,
+  onDiagnosticOperation,
 }: OffsetControlProps) {
+  const [diagnostics] = useState(() =>
+    diagnosticContext ? createOffsetUiDiagnostics('OffsetControl') : null
+  )
+  const diagnosticSequence = useRef(0)
+  const diagnosticSnapshot = useRef<OffsetDiagnosticFields>({})
+
+  useEffect(() => {
+    diagnosticSnapshot.current = {
+      ...diagnosticContext,
+      offset: value,
+      compact: Boolean(compact),
+      applyDisabled: isValueChanged === false,
+    }
+  }, [diagnosticContext, value, compact, isValueChanged])
+
+  useEffect(() => {
+    diagnostics?.log('ui.mount', {
+      ...diagnosticSnapshot.current,
+      lifecycleObservation: 'effect-setup',
+    })
+    return () =>
+      diagnostics?.log('ui.unmount', {
+        ...diagnosticSnapshot.current,
+        lifecycleObservation: 'effect-cleanup',
+      })
+  }, [diagnostics])
+
+  function logOperation(
+    operation: OffsetUiOperation,
+    fields: OffsetDiagnosticFields = {}
+  ) {
+    if (!diagnostics) return
+    const details = {
+      ...diagnosticContext,
+      offset: value,
+      operation,
+      controlUiInstanceId: diagnostics.uiInstanceId,
+      uiOperationId: `${diagnostics.uiInstanceId}-${++diagnosticSequence.current}`,
+      applyDisabled: isValueChanged === false,
+      ...fields,
+    }
+    diagnostics.log('ui.offset-control.operation', details)
+    onDiagnosticOperation?.(operation, details)
+  }
+
   function onValueChangeInput(val: string) {
-    onValueChange(Number(val))
+    const nextOffset = Number(val)
+    logOperation('input', { nextOffset })
+    onValueChange(nextOffset)
   }
 
   function onPressReset() {
+    logOperation('reset', { nextOffset: 0, writesState: false })
     onValueChange(0)
+  }
+
+  function onPressStep(sec: number) {
+    logOperation('±button', { deltaSeconds: sec, nextOffset: value + sec })
+    onValueChange(value + sec)
   }
 
   return (
@@ -35,7 +101,7 @@ export function OffsetControl({
                 'min-w-8 px-2',
                 'border-divider not-first:border-l-1'
               )}
-              onPress={() => onValueChange(value + sec)}
+              onPress={() => onPressStep(sec)}
             >
               {sec}
             </Button>
@@ -68,7 +134,7 @@ export function OffsetControl({
                 'min-w-8 px-2',
                 'border-divider not-first:border-l-1'
               )}
-              onPress={() => onValueChange(value + sec)}
+              onPress={() => onPressStep(sec)}
             >
               +{sec}
             </Button>
@@ -99,7 +165,13 @@ export function OffsetControl({
           isIconOnly={compact}
           isDisabled={isValueChanged === false}
           startContent={<CheckIcon className="size-4" />}
-          onPress={onApply}
+          onPress={(event) => {
+            logOperation('apply', {
+              applyOffset: value,
+              pressPointerType: event?.pointerType,
+            })
+            onApply()
+          }}
         >
           {!compact && <span>適用</span>}
         </Button>

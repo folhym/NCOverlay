@@ -5,6 +5,7 @@ import {
   emitOffsetDiagnostic,
   getDiagnosticVideoSnapshot,
 } from '../src/utils/offsetDiagnostics'
+import { createOffsetUiDiagnostics } from '../src/utils/offsetUiDiagnostics'
 
 const TIMESTAMP_REGEXP = /^\d{4}-\d{2}-\d{2}T/
 let output
@@ -121,4 +122,89 @@ test('console and diagnostic observation failures do not escape to playback code
   })
   expect(() => emitOffsetDiagnostic('dispose')).not.toThrow()
   expect(() => session.log('dispose')).not.toThrow()
+})
+
+function withUiDocument(run) {
+  const savedLocation = Object.getOwnPropertyDescriptor(globalThis, 'location')
+  const savedDocument = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const page = {
+    protocol: 'chrome-extension:',
+    pathname: '/sidepanel.html',
+    search: '?authorization=private-query',
+  }
+  const doc = { visibilityState: 'hidden', hasFocus: () => false }
+  Object.defineProperty(globalThis, 'location', {
+    configurable: true,
+    value: page,
+  })
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: doc,
+  })
+  try {
+    run(page, doc)
+  } finally {
+    if (savedLocation) {
+      Object.defineProperty(globalThis, 'location', savedLocation)
+    } else {
+      Reflect.deleteProperty(globalThis, 'location')
+    }
+    if (savedDocument) {
+      Object.defineProperty(globalThis, 'document', savedDocument)
+    } else {
+      Reflect.deleteProperty(globalThis, 'document')
+    }
+  }
+}
+
+test('UI IDs distinguish instances and snapshot document focus without exposing paths', () => {
+  const latest = capture()
+  withUiDocument((page, doc) => {
+    const global = createOffsetUiDiagnostics('GlobalOffsetControl')
+    const control = createOffsetUiDiagnostics('OffsetControl')
+    global.log('ui.mount', { stateOffset: 120, offset: 0, currentOffset: 120 })
+    const mounted = latest()
+    control.log('ui.offset-control.operation', {
+      globalUiInstanceId: global.uiInstanceId,
+      operation: 'apply',
+      applyOffset: 0,
+    })
+    const applied = latest()
+    expect(applied.uiInstanceId).not.toBe(mounted.uiInstanceId)
+    expect(applied.contextId).toBe(mounted.contextId)
+    expect(applied.globalUiInstanceId).toBe(mounted.uiInstanceId)
+    expect(applied.entrypoint).toBe('sidepanel')
+    expect(applied.context).toBe('extension-page')
+    expect(applied.visibilityState).toBe('hidden')
+    expect(applied.hasFocus).toBe(false)
+    expect(applied.applyOffset).toBe(0)
+    expect(mounted.stateOffset).toBe(120)
+    expect(JSON.stringify(applied)).not.toContain('private-query')
+
+    page.pathname = '/private-email@example.com'
+    doc.visibilityState = 'visible'
+    doc.hasFocus = () => true
+    global.log('ui.unmount')
+    expect(latest().entrypoint).toBe('unknown')
+    expect(latest().visibilityState).toBe('visible')
+    expect(latest().hasFocus).toBe(true)
+    expect(JSON.stringify(latest())).not.toContain('example.com')
+  })
+})
+
+test('UI observation errors do not escape into an offset write', () => {
+  const latest = capture()
+  withUiDocument((_page, doc) => {
+    doc.hasFocus = () => {
+      throw new Error('private-focus-detail')
+    }
+    const ui = createOffsetUiDiagnostics('GlobalOffsetControl')
+    expect(() => ui.log('ui.global-offset.write')).not.toThrow()
+    expect(latest().documentContextUnavailable).toBe(true)
+    expect(JSON.stringify(latest())).not.toContain('private-focus-detail')
+    output.mockImplementation(() => {
+      throw new Error('console unavailable')
+    })
+    expect(() => ui.log('ui.global-offset.write')).not.toThrow()
+  })
 })

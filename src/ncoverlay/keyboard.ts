@@ -5,6 +5,7 @@ import type { NCOState } from './state'
 
 import hotkeys from 'hotkeys-js'
 
+import { createOffsetUiDiagnostics } from '@/utils/offsetUiDiagnostics'
 import { settings } from '@/utils/settings/extension'
 import { storage } from '@/utils/storage/extension'
 
@@ -42,17 +43,21 @@ function register(
 export class NCOKeyboard {
   readonly #state: NCOState
   readonly #functions: NCOKeyboardFunctions
+  readonly #diagnostics: ReturnType<typeof createOffsetUiDiagnostics>
 
   readonly #storageOnChangeRemoveListeners: (() => void)[] = []
 
   constructor(state: NCOState, functions: NCOKeyboardFunctions) {
     this.#state = state
     this.#functions = functions
+    this.#diagnostics = createOffsetUiDiagnostics('NCOKeyboard')
+    this.#diagnostics.log('ui.keyboard.mount', { tabId: this.#state.id })
 
     this.#registerEventListener()
   }
 
   dispose() {
+    this.#diagnostics.log('ui.keyboard.dispose', { tabId: this.#state.id })
     this.#unregisterEventListener()
   }
 
@@ -60,7 +65,19 @@ export class NCOKeyboard {
     return (await this.#state.get('offset')) ?? 0
   }
 
-  async _setOffset(offset: number | null) {
+  async _setOffset(
+    offset: number | null,
+    operation:
+      | 'increase-shortcut'
+      | 'decrease-shortcut'
+      | 'reset-shortcut'
+      | 'keyboard' = 'keyboard'
+  ) {
+    this.#diagnostics.log('ui.offset.write-request', {
+      tabId: this.#state.id,
+      operation,
+      requestedOffsetSeconds: offset,
+    })
     return this.#state.set('offset', offset)
   }
 
@@ -83,15 +100,15 @@ export class NCOKeyboard {
       }),
 
       register('increaseGlobalOffset', async () => {
-        this._setOffset((await this._getOffset()) + 1)
+        this._setOffset((await this._getOffset()) + 1, 'increase-shortcut')
       }),
 
       register('decreaseGlobalOffset', async () => {
-        this._setOffset((await this._getOffset()) - 1)
+        this._setOffset((await this._getOffset()) - 1, 'decrease-shortcut')
       }),
 
       register('resetGlobalOffset', async () => {
-        this._setOffset(null)
+        this._setOffset(null, 'reset-shortcut')
       }),
 
       register('jumpMarkerToStart', () => {
