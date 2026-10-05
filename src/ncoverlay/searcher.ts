@@ -20,6 +20,7 @@ import {
 import { NICO_LIVE_ANIME_ROOT } from '@midra/nco-utils/api/services/nicolog/list'
 import { REGEXP_DANIME_CHAPTER } from '@midra/nco-utils/search/constants'
 
+import { filterAutomaticSearchTargets } from '@/timeline-sync/sourcePolicy'
 import { logger } from '@/utils/logger'
 import { getJikkyoKakolog } from '@/utils/api/jikkyo/getJikkyoKakolog'
 import { getNicologComment } from '@/utils/api/nicolog/getNicologComment'
@@ -57,11 +58,16 @@ export class NCOSearcher {
   }
 
   async autoSearch(args: NCOSearcherAutoSearchArgs) {
+    const targets: AutoSearchTarget[] = filterAutomaticSearchTargets(
+      args.targets
+    )
+
+    if (!targets.length) return
+
     args.input = parse(args.input)
 
     const isAutoLoaded = true
-    const { input, duration, targets, jikkyoChannelIds, jikkyoIgnoreRerun } =
-      args
+    const { input, duration, jikkyoChannelIds, jikkyoIgnoreRerun } = args
 
     const channelIds = jikkyoChannelIds
       ?.map((jkId) => jikkyoSyobocalChIdMap.get(jkId))
@@ -128,6 +134,8 @@ export class NCOSearcher {
       type: Exclude<StateSlotDetailDefault['type'], 'normal'>,
       results: SnapshotV2DataWithFields[]
     ) {
+      if (!targets.includes(type)) return
+
       for (const data of results) {
         if (loadedIds.includes(data.contentId)) continue
 
@@ -232,9 +240,11 @@ export class NCOSearcher {
         })
       ),
       Promise.all(
-        searchNiconicoResults.chapter.map((data) => {
-          return getNiconicoComment(data.contentId)
-        })
+        (targets.includes('chapter') ? searchNiconicoResults.chapter : []).map(
+          (data) => {
+            return getNiconicoComment(data.contentId)
+          }
+        )
       ),
       Promise.all(
         loadingSlotDetails.szbh.values().map((detail) => {

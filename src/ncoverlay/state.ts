@@ -1,6 +1,7 @@
 import type { JikkyoChannelId } from '@midra/nco-utils/types/api/constants'
 import type * as ThreadsV1 from '@midra/nco-utils/types/api/niconico/threads/v1'
 import type { DeepPartial } from 'utility-types'
+import type { ProviderTimeline } from '@/timeline-sync/core'
 import type { VodKey } from '@/types/constants'
 import type {
   JikkyoChapter,
@@ -17,6 +18,8 @@ import {
   NICONICO_COLOR_COMMANDS,
   NICONICO_DEFAULT_DURATION,
 } from '@/constants'
+import { createCommentTimelinePlan } from '@/timeline-sync/commentTimeline'
+import { mapTimelineTime } from '@/timeline-sync/core'
 import { deepmerge } from '@/utils/deepmerge'
 import { logger } from '@/utils/logger'
 import { filterThreadsByJikkyoChapters } from '@/utils/api/jikkyo/findChapters'
@@ -64,6 +67,7 @@ export type StateVod = VodKey
 
 export type StateInfo = Partial<NCOSearcherAutoSearchArgs> & {
   chapters?: VideoChapter[]
+  providerTimeline?: ProviderTimeline
   disableAdjustJikkyoOffset?: boolean
   isNhkOndemand?: boolean
 }
@@ -205,6 +209,7 @@ export async function filterDisplayThreads(
 ): Promise<NcoThreadsV1Thread[] | null> {
   const slots = await ncoState.get('slots')
   const details = await ncoState.get('slotDetails')
+  const info = await ncoState.get('info')
 
   if (!slots?.length || !details?.length) {
     return null
@@ -251,6 +256,12 @@ export async function filterDisplayThreads(
     const slot = slots.find((slot) => slot.id === id)
 
     if (!slot) continue
+
+    const timelinePlan = createCommentTimelinePlan(
+      slot.threads,
+      detail,
+      info?.providerTimeline
+    )
 
     // 実況: オフセット自動調節
     if (type === 'jikkyo') {
@@ -355,8 +366,9 @@ export async function filterDisplayThreads(
           continue
         }
 
-        // オフセット
-        const vposMs = cmt.vposMs + (offsetMs ?? 0)
+        // Source → provider timeline → Slot Offset. Global Offset stays in Renderer.
+        const vposMs =
+          mapTimelineTime(cmt.vposMs, timelinePlan) + (offsetMs ?? 0)
 
         let commands = [...cmt.commands]
         let isPremium = cmt.isPremium
