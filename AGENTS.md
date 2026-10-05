@@ -29,5 +29,5 @@
 - 実機確認が必要な DOM / API / playback / 広告挙動は、mock や静的調査だけで確認済みとしない。
 - PR 本文には Purpose / Changes / Architecture / Files / Verification / Manual verification / Risks / Upstream compatibility / Open questions を含める。
 - 完了時に branch、commit SHA、Draft PR URL、変更ファイル、主要結論、未確認事項、次工程案を報告する。
-- コード、UI、設定の実変更時は原則 `review_pack/REVIEW.md` と `review_pack/changes.diff` を作る。要求、変更内容とファイル、主要箇所、検証結果、既知問題、独立レビューの重点を記載し、Git diff と照合可能な根拠を優先する。
-- UI 変更時は可能なら変更後のスクリーンショットを添える。調査のみ、回答のみ、変更なし、ごく軽微な変更は review_pack を省略できる。資料のために本実装を複雑化しない。
+- 独立レビューは GitHub 上の最新 branch / Draft PR / diff を基準として行う。ローカル `review_pack` は生成しない。
+- 要求、変更内容、主要ファイル、検証結果、既知問題・未確認事項を PR 本文へ集約し、GitHub の commit / diff と照合できるようにする。
