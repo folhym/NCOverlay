@@ -1,7 +1,6 @@
 import type { SlotsToClasses } from '@heroui/react'
 import type { NcoThreadsV1Comment, StateSlotDetail } from '@/ncoverlay/state'
 
-import { useRef } from 'react'
 import {
   Dropdown,
   DropdownItem,
@@ -17,7 +16,6 @@ import { useOverflowDetector } from 'react-detectable-overflow'
 import { COLOR_CODE_REGEXP, NICONICO_COLORS } from '@/constants'
 import { readableColor } from '@/utils/color'
 import { formatDate, formatDuration } from '@/utils/format'
-import { createOffsetUiDiagnostics } from '@/utils/offsetUiDiagnostics'
 import { settings } from '@/utils/settings/extension'
 import { ncoState } from '@/hooks/useNco'
 import { sendExtensionMessage } from '@/messaging/extension'
@@ -174,9 +172,6 @@ export interface ItemProps {
 }
 
 export function Item({ comment, offsetMs }: ItemProps) {
-  const diagnosticsRef = useRef<ReturnType<
-    typeof createOffsetUiDiagnostics
-  > | null>(null)
   const { ref, overflow } = useOverflowDetector()
 
   const { cmtCellCmdClass, cmtCmdClass, cmtStyle } = getCmtClassAndColor(
@@ -323,17 +318,10 @@ export function Item({ comment, offsetMs }: ItemProps) {
     const currentTime =
       (await sendExtensionMessage('content:getCurrentTime', null)) ?? 0
 
-    const requestedOffsetSeconds = Math.floor(
-      (comment.vposMs / 1000) * -1 + currentTime
+    await ncoState?.set(
+      'offset',
+      Math.floor((comment.vposMs / 1000) * -1 + currentTime)
     )
-    diagnosticsRef.current ??= createOffsetUiDiagnostics('CommentList.Item')
-    diagnosticsRef.current.log('ui.offset.write-request', {
-      tabId: ncoState?.id ?? null,
-      operation: 'comment-time-menu',
-      requestedOffsetSeconds,
-    })
-
-    await ncoState?.set('offset', requestedOffsetSeconds)
 
     sendExtensionMessage('content:rerender', null)
   }

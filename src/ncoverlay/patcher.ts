@@ -7,7 +7,6 @@ import type { StateFileDetail, StateInfo } from './state'
 import { parse } from '@midra/nco-utils/parse'
 
 import { logger } from '@/utils/logger'
-import { createOffsetDiagnostics } from '@/utils/offsetDiagnostics'
 import { settings } from '@/utils/settings/extension'
 import { sendExtensionMessage } from '@/messaging/extension'
 
@@ -29,9 +28,6 @@ export interface NCOPatcherInit {
     nco: NCOverlay,
     args: NCOSearcherAutoSearchArgs & StateInfo
   ) => Promise<void>
-  diagnostics?: {
-    getContentId: () => string | null
-  }
 }
 
 export interface NCOPatcherFunctions {
@@ -65,24 +61,17 @@ export class NCOPatcher {
 
   async dispose() {
     logger.log('NCOPatcher.dispose()')
-    const diagnostics = this.#nco?.diagnostics
-    diagnostics?.log('patcher.dispose.begin')
 
     await this.#nco?.dispose()
 
     this.#video = null
     this.#nco = null
-    diagnostics?.log('patcher.dispose.end')
   }
 
   async setVideo(
     video: HTMLVideoElement,
     fileDetail: StateFileDetail | null = null
   ) {
-    this.#nco?.diagnostics?.log('patcher.set-video', {
-      sameVideo: this.#video === video,
-      requestedVideoConnected: video.isConnected,
-    })
     if (this.#video === video) return
 
     logger.log('NCOPatcher.setVideo()')
@@ -97,22 +86,7 @@ export class NCOPatcher {
 
     await this.#nco?.dispose()
 
-    const diagnostics = this.#init.diagnostics
-      ? createOffsetDiagnostics(
-          this.#vod,
-          this.#tabId,
-          this.#video,
-          this.#init.diagnostics.getContentId
-        )
-      : undefined
-
-    this.#nco = new NCOverlay(
-      this.#tabId,
-      this.#video,
-      this.#functions,
-      diagnostics
-    )
-    diagnostics?.log('patcher.set-video.created')
+    this.#nco = new NCOverlay(this.#tabId, this.#video, this.#functions)
 
     this.#nco.state.set('vod', this.#vod)
     this.#nco.state.set('fileDetail', fileDetail)
@@ -121,25 +95,9 @@ export class NCOPatcher {
       if (!this.#nco) return
 
       logger.log('NCOPatcher.setVideo > loadInfo()')
-      const requestDiagnostics = this.#nco.diagnostics
 
       try {
-        requestDiagnostics?.log('patcher.get-info.before', {
-          requestGeneration: requestDiagnostics.generation,
-          currentGeneration: this.#nco?.diagnostics?.generation ?? null,
-          generationMatches:
-            requestDiagnostics.generation ===
-            this.#nco?.diagnostics?.generation,
-        })
         const info = await this.#init.getInfo(this.#nco)
-        requestDiagnostics?.log('patcher.get-info.after', {
-          requestGeneration: requestDiagnostics.generation,
-          currentGeneration: this.#nco?.diagnostics?.generation ?? null,
-          generationMatches:
-            requestDiagnostics.generation ===
-            this.#nco?.diagnostics?.generation,
-          returnedInfo: info !== null,
-        })
 
         let parsed: ParsedResult | undefined
 
@@ -173,13 +131,6 @@ export class NCOPatcher {
 
         logger.log('state.info', args)
       } catch (err) {
-        requestDiagnostics?.log('patcher.get-info.failed', {
-          requestGeneration: requestDiagnostics.generation,
-          currentGeneration: this.#nco?.diagnostics?.generation ?? null,
-          generationMatches:
-            requestDiagnostics.generation ===
-            this.#nco?.diagnostics?.generation,
-        })
         logger.error('NCOPatcher.setVideo > loadInfo()', err)
       }
     }
@@ -235,30 +186,13 @@ export class NCOPatcher {
 
     this.#nco.addEventListener('loadedmetadata', async function () {
       const now = performance.now()
-      const deltaMs = prev === null ? null : now - prev
       const isSkip = prev !== null && now - prev < 1000
-      const metadataSource = this.diagnostics?.metadataSource ?? null
 
       prev = now
 
-      this.diagnostics?.log('patcher.loadedmetadata', {
-        metadataSource,
-        deltaMs,
-        skipped: isSkip,
-        clearWillRun: !isSkip,
-      })
-
       if (isSkip) return
 
-      this.diagnostics?.log('patcher.loadedmetadata.clear-before', {
-        metadataSource,
-        ...this.renderer.getDiagnosticSnapshot(),
-      })
       await this.clear()
-      this.diagnostics?.log('patcher.loadedmetadata.clear-after', {
-        metadataSource,
-        ...this.renderer.getDiagnosticSnapshot(),
-      })
 
       await loadInfo()
 
@@ -268,7 +202,6 @@ export class NCOPatcher {
     })
 
     this.#nco.addEventListener('reload', async function () {
-      this.diagnostics?.log('patcher.reload')
       await this.state.remove('status')
       await this.state.remove('slots', { isAutoLoaded: true })
       await this.state.remove('slotDetails', { isAutoLoaded: true })

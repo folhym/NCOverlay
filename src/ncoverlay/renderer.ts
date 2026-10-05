@@ -1,10 +1,6 @@
 import type * as ThreadsV1 from '@midra/nco-utils/types/api/niconico/threads/v1'
 import type { BaseOptions } from '@xpadev-net/niconicomments'
 import type { SettingItems } from '@/types/storage'
-import type {
-  OffsetDiagnosticFields,
-  OffsetDiagnosticLogger,
-} from '@/utils/offsetDiagnostics'
 import type { NCOPatcherFunctions } from './patcher'
 
 import NiconiComments from '@xpadev-net/niconicomments'
@@ -22,7 +18,6 @@ interface NiconiCommentsOptions
 export class NCORenderer {
   #video: HTMLVideoElement
   #canvas: HTMLCanvasElement
-  readonly #diagnosticLog?: OffsetDiagnosticLogger
 
   #niconicomments: NiconiComments | null = null
   #threads: ThreadsV1.Thread[] | null = null
@@ -49,10 +44,8 @@ export class NCORenderer {
 
   constructor(
     video: HTMLVideoElement,
-    { getCurrentTime }: NCOPatcherFunctions = {},
-    diagnosticLog?: OffsetDiagnosticLogger
+    { getCurrentTime }: NCOPatcherFunctions = {}
   ) {
-    this.#diagnosticLog = diagnosticLog
     this.#video = video
     this.#video.classList.add('NCOverlay-Video')
 
@@ -92,7 +85,6 @@ export class NCORenderer {
   }
 
   clear() {
-    this.#diagnosticLog?.('renderer.clear.before', this.getDiagnosticSnapshot())
     this.stop()
 
     this.#niconicomments?.clear()
@@ -107,18 +99,6 @@ export class NCORenderer {
     this.#playbackRate = 1
 
     document.body.classList.remove('NCOverlay-Capture')
-    this.#diagnosticLog?.('renderer.clear.after', this.getDiagnosticSnapshot())
-  }
-
-  getDiagnosticSnapshot(): OffsetDiagnosticFields {
-    return {
-      rendererOffsetSeconds: this.#offset,
-      rendererStartTimeSeconds: this.#startTime,
-      rendererStartVpos: this.#startTimeVpos,
-      rendererElapsedMs: performance.now() - this.#startTimestamp,
-      rendererPlaybackRate: this.#playbackRate,
-      rendererRunning: Boolean(this.#frameId),
-    }
   }
 
   /**
@@ -136,11 +116,6 @@ export class NCORenderer {
   }
 
   setOffset(offset: number) {
-    this.#diagnosticLog?.('renderer.offset.set', {
-      ...this.getDiagnosticSnapshot(),
-      requestedOffsetSeconds: offset,
-      changed: this.#offset !== offset,
-    })
     if (this.#offset !== offset) {
       this.#offset = offset
       this.#startTimeVpos = Math.max((this.#startTime - this.#offset) * 100, 0)
@@ -148,10 +123,6 @@ export class NCORenderer {
       if (!this.#frameId) {
         this.render()
       }
-      this.#diagnosticLog?.(
-        'renderer.offset.applied',
-        this.getDiagnosticSnapshot()
-      )
     }
   }
 
@@ -174,7 +145,6 @@ export class NCORenderer {
     this.#startTime = this.getCurrentTime()
     this.#startTimeVpos = Math.max((this.#startTime - this.#offset) * 100, 0)
     this.#playbackRate = this.#video.playbackRate
-    this.#diagnosticLog?.('renderer.clock.update', this.getDiagnosticSnapshot())
   }
 
   reload() {
