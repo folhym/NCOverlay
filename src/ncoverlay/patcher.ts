@@ -26,12 +26,20 @@ export interface PlayingInfo {
 }
 
 export interface NCOPatcherInit {
-  getInfo: (nco: NCOverlay) => Promise<PlayingInfo | null>
+  getInfo: (
+    nco: NCOverlay,
+    request: NCOPatcherInfoRequest
+  ) => Promise<PlayingInfo | null>
   appendCanvas: (video: HTMLVideoElement, canvas: HTMLCanvasElement) => void
   autoSearch?: (
     nco: NCOverlay,
     args: NCOSearcherAutoSearchArgs & StateInfo
   ) => Promise<void>
+}
+
+export interface NCOPatcherInfoRequest {
+  /** Optional provider check immediately before committing even a null result. */
+  isCurrent?: () => boolean
 }
 
 export interface NCOPatcherFunctions {
@@ -101,7 +109,10 @@ export class NCOPatcher {
       logger.log('NCOPatcher.setVideo > loadInfo()')
 
       try {
-        const info = await this.#init.getInfo(this.#nco)
+        const request: NCOPatcherInfoRequest = {}
+        const info = await this.#init.getInfo(this.#nco, request)
+
+        if (request.isCurrent && !request.isCurrent()) return
 
         let parsed: ParsedResult | undefined
 
