@@ -1,4 +1,5 @@
 import type { ParsedResult } from '@midra/nco-utils/parse'
+import type { ProviderTimeline } from '@/timeline-sync/core'
 import type { VodKey } from '@/types/constants'
 import type { VideoChapter } from '@/utils/api/jikkyo/findChapters'
 import type { NCOSearcherAutoSearchArgs } from './searcher'
@@ -6,6 +7,7 @@ import type { StateFileDetail, StateInfo } from './state'
 
 import { parse } from '@midra/nco-utils/parse'
 
+import { filterAutomaticSearchTargets } from '@/timeline-sync/sourcePolicy'
 import { logger } from '@/utils/logger'
 import { settings } from '@/utils/settings/extension'
 import { sendExtensionMessage } from '@/messaging/extension'
@@ -16,6 +18,8 @@ export interface PlayingInfo {
   input: string | ParsedResult
   duration: number
   chapters?: VideoChapter[]
+  /** Confirmed anchors in the same media clock used by Renderer; no wall time. */
+  providerTimeline?: ProviderTimeline
   disableParse?: boolean
   disableAdjustJikkyoOffset?: boolean
   isNhkOndemand?: boolean
@@ -123,6 +127,7 @@ export class NCOPatcher {
           input: parsed ?? '',
           duration: info ? Math.floor(info.duration) : 0,
           chapters: info?.chapters,
+          providerTimeline: info?.providerTimeline,
           disableAdjustJikkyoOffset: info?.disableAdjustJikkyoOffset,
           isNhkOndemand: info?.isNhkOndemand,
         }
@@ -167,8 +172,11 @@ export class NCOPatcher {
           ...info,
         }
 
+        // Filter after info overrides so custom automatic searchers share the policy.
+        args.targets = filterAutomaticSearchTargets(args.targets)
+
         // 自動検索
-        if (targets.length && args.input && args.duration) {
+        if (args.targets.length && args.input && args.duration) {
           if (this.#init.autoSearch) {
             await this.#init.autoSearch(this.#nco, args)
           } else {

@@ -41,6 +41,7 @@ export function CommentList() {
   const stateOffset = useNcoState('offset')
   const stateSlots = useNcoState('slots')
   const stateSlotDetails = useNcoState('slotDetails')
+  const stateInfo = useNcoState('info')
 
   const [smoothScrolling] = useSettings('commentList:smoothScrolling')
 
@@ -50,14 +51,22 @@ export function CommentList() {
   useEffect(() => {
     if (!ncoState) return
 
+    let cancelled = false
+
     filterDisplayThreads(ncoState).then((threads) => {
+      if (cancelled) return
+
       const comments: NcoThreadsV1Comment[] | undefined = threads
         ?.flatMap((thread) => thread.comments)
         .sort((a, b) => a.vposMs - b.vposMs)
 
       setComments(comments ?? [])
     })
-  }, [stateSlots, stateSlotDetails])
+
+    return () => {
+      cancelled = true
+    }
+  }, [stateSlots, stateSlotDetails, stateInfo?.providerTimeline])
 
   useEffect(() => {
     if (isHover) return
@@ -76,7 +85,7 @@ export function CommentList() {
         })
       }
     })
-  }, [virtuoso.current, isHover, behavior])
+  }, [virtuoso.current, isHover, behavior, comments])
 
   return (
     <Virtuoso

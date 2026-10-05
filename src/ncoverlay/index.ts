@@ -41,6 +41,8 @@ export class NCOverlay {
   readonly #removeListenerCallbacks: (() => void)[] = []
   readonly #port: Browser.runtime.Port
 
+  #threadRevision = 0
+
   get video() {
     return this.renderer.video
   }
@@ -85,7 +87,9 @@ export class NCOverlay {
   async dispose() {
     logger.log('NCOverlay.dispose()')
 
+    this.#threadRevision++
     await this.state.dispose()
+    this.#threadRevision++
     this.renderer.dispose()
     this.keyboard.dispose()
 
@@ -100,7 +104,9 @@ export class NCOverlay {
   async clear() {
     logger.log('NCOverlay.clear()')
 
+    this.#threadRevision++
     await this.state.clear()
+    this.#threadRevision++
     this.renderer.clear()
 
     await sendExtensionMessage('bg:setBadge', { text: null })
@@ -157,7 +163,10 @@ export class NCOverlay {
    * 描画するコメントデータを更新する
    */
   #updateRendererThreads = async () => {
+    const revision = ++this.#threadRevision
     const threads = await this.state.getThreads()
+
+    if (revision !== this.#threadRevision) return
 
     this.renderer.setThreads(threads)
     this.renderer.reload()
@@ -256,6 +265,13 @@ export class NCOverlay {
 
       // スロット
       this.state.onChange('slots', this.#updateRendererThreads),
+
+      // Provider timeline changes also refresh manually added eligible slots.
+      this.state.onChange('info', (newValue, oldValue) => {
+        if (!equal(newValue?.providerTimeline, oldValue?.providerTimeline)) {
+          this.#updateRendererThreads()
+        }
+      }),
 
       // スロットの情報
       this.state.onChange('slotDetails', (newValue, oldValue) => {

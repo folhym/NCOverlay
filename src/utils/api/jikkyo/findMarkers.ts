@@ -10,7 +10,8 @@ export type JikkyoMarker = number | null
  */
 export function findMarkers(
   threads: ThreadsV1.Thread[],
-  info: StateInfo | null
+  info: StateInfo | null,
+  minimumSupport = 1
 ): JikkyoMarker[] {
   if (info?.disableAdjustJikkyoOffset) {
     return []
@@ -78,7 +79,7 @@ export function findMarkers(
       }
     }
 
-    if (tmpCount) {
+    if (tmpCount && minimumSupport <= tmpCount) {
       prevVposMs = tmpVposMs
 
       return tmpVposMs
