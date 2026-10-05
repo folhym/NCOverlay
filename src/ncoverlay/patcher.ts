@@ -18,7 +18,7 @@ export interface PlayingInfo {
   input: string | ParsedResult
   duration: number
   chapters?: VideoChapter[]
-  /** Confirmed anchors in the same media clock used by Renderer; no wall time. */
+  /** Confirmed anchors or direct mappings into Renderer's media clock; no wall time. */
   providerTimeline?: ProviderTimeline
   disableParse?: boolean
   disableAdjustJikkyoOffset?: boolean

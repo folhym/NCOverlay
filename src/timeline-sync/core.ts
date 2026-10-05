@@ -13,7 +13,9 @@ export interface TimelineAnchor {
 
 /** Target coordinates are the media clock consumed by NCOverlay's Renderer. */
 export interface ProviderTimeline {
-  readonly anchors: readonly TimelineAnchor[]
+  readonly anchors?: readonly TimelineAnchor[]
+  /** Confirmed raw-comment → media-clock boundaries; take priority over anchors. */
+  readonly alignments?: readonly TimelineAlignment[]
   readonly durationMs?: number
 }
 
@@ -111,12 +113,13 @@ export function createTimelinePlan(
   if (provider.durationMs !== undefined && !isTime(provider.durationMs)) {
     return unavailable('provider-duration-invalid')
   }
-  if (!validAnchors(provider.anchors, provider.durationMs)) {
+  const providerAnchors = provider.anchors
+  if (!providerAnchors || !validAnchors(providerAnchors, provider.durationMs)) {
     return unavailable('provider-anchors-invalid')
   }
 
   const source = sourceAnchors.filter(trusted)
-  const target = provider.anchors.filter(trusted)
+  const target = providerAnchors.filter(trusted)
   const sourceKeys = new Set(source.map(({ key }) => key))
   const targetByKey = new Map(target.map((anchor) => [anchor.key, anchor]))
   const sharedSource = source.filter(({ key }) => targetByKey.has(key))
@@ -143,8 +146,12 @@ export function createTimelinePlan(
  * overlap target ranges; this offset-only plan never guesses or deletes gaps.
  */
 export function createTimelinePlanFromAlignments(
-  alignments: readonly TimelineAlignment[]
+  alignments: readonly TimelineAlignment[],
+  durationMs?: number
 ): TimelinePlan {
+  if (durationMs !== undefined && !isTime(durationMs)) {
+    return unavailable('provider-duration-invalid')
+  }
   if (!Array.isArray(alignments)) return unavailable('alignments-invalid')
 
   let previousSource = -1
@@ -156,6 +163,7 @@ export function createTimelinePlanFromAlignments(
       typeof alignment !== 'object' ||
       !isTime(alignment.sourceTimeMs) ||
       !isTime(alignment.targetTimeMs) ||
+      (durationMs !== undefined && durationMs < alignment.targetTimeMs) ||
       alignment.sourceTimeMs <= previousSource ||
       alignment.targetTimeMs <= previousTarget ||
       typeof alignment.reason !== 'string' ||

@@ -5,7 +5,7 @@ import type { ProviderTimeline, TimelineAnchor } from './core'
 import { MARKERS } from '@/constants/markers'
 import { findMarkers } from '@/utils/api/jikkyo/findMarkers'
 
-import { createTimelinePlan } from './core'
+import { createTimelinePlan, createTimelinePlanFromAlignments } from './core'
 import { isTimelineSyncSource } from './sourcePolicy'
 
 /** Reuse the existing detector in source coordinates, without VOD chapter bounds. */
@@ -32,6 +32,17 @@ export function createCommentTimelinePlan(
 ) {
   if (!isTimelineSyncSource(detail) || !providerTimeline) {
     return createTimelinePlan([], null)
+  }
+
+  if (typeof providerTimeline !== 'object' || Array.isArray(providerTimeline)) {
+    return createTimelinePlan([], providerTimeline)
+  }
+
+  if (providerTimeline.alignments !== undefined) {
+    return createTimelinePlanFromAlignments(
+      providerTimeline.alignments,
+      providerTimeline.durationMs
+    )
   }
 
   return createTimelinePlan(
