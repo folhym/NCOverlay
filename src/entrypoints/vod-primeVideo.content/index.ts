@@ -4,6 +4,7 @@ import { defineContentScript } from '#imports'
 import { parse } from '@midra/nco-utils/parse'
 import { normalize } from '@midra/nco-utils/parse/libs/normalize'
 
+import { inspectPrimeTimeline } from '@/timeline-sync/providers/primeVideo'
 import { MATCHES } from '@/constants/matches'
 import { logger } from '@/utils/logger'
 import { sleep } from '@/utils/sleep'
@@ -29,7 +30,7 @@ async function main() {
   logger.log('vod', vod)
 
   const patcher = new NCOPatcher(vod, {
-    getInfo: async () => {
+    getInfo: async (nco) => {
       await sleep(2000)
 
       const playbackInfo = await sendPageMessage(
@@ -37,7 +38,12 @@ async function main() {
         null
       )
 
-      logger.log('getPlaybackInfo', playbackInfo)
+      const inspection = inspectPrimeTimeline(
+        playbackInfo?.timelineEvidence,
+        nco.video.duration,
+        nco.video.currentTime
+      )
+      logger.log('primeVideo.timelineEvidence', inspection.diagnostics)
 
       if (!playbackInfo) {
         return null
