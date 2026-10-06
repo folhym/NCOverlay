@@ -1,3 +1,4 @@
+import type { PrimeTimelineEvidence } from '@/timeline-sync/providers/primeVideo'
 import type { VodKey } from '@/types/constants'
 import type {
   GetVodPlaybackResources,
@@ -10,6 +11,7 @@ import type {
 
 import { defineContentScript } from '#imports'
 
+import { extractPrimeTimelineEvidence } from '@/timeline-sync/providers/primeVideo'
 import { MATCHES } from '@/constants/matches'
 import { convertURL } from '@/utils/convertURL'
 import { logger } from '@/utils/logger'
@@ -38,6 +40,7 @@ export interface PrimeVideoPlaybackInfo {
   id: string
   playbackUrls: PlaybackUrls
   catalog: Catalog
+  timelineEvidence?: PrimeTimelineEvidence
 }
 
 async function main() {
@@ -45,7 +48,10 @@ async function main() {
 
   logger.log('page', vod)
 
-  const playbackUrlsQueue = new LRUQueue<PlaybackUrls>(25)
+  const playbackUrlsQueue = new LRUQueue<{
+    playbackUrls: PlaybackUrls
+    timelineEvidence: PrimeTimelineEvidence
+  }>(25)
   const catalogQueue = new LRUQueue<Catalog>(25)
 
   onPageMessage('page:primeVideo:getPlaybackInfo', async () => {
@@ -105,13 +111,13 @@ async function main() {
 
     const id = catalogQueueItem[0]
     const catalog = catalogQueueItem[1]
-    const playbackUrls = playbackUrlsQueue.get(id)
+    const playbackResource = playbackUrlsQueue.get(id)
 
-    if (!playbackUrls) {
+    if (!playbackResource?.playbackUrls) {
       return null
     }
 
-    return { id, playbackUrls, catalog }
+    return { id, ...playbackResource, catalog }
   })
 
   // fetch
@@ -147,7 +153,10 @@ async function main() {
               },
             } = json
 
-            playbackUrlsQueue.add(titleId, playbackUrls)
+            playbackUrlsQueue.add(titleId, {
+              playbackUrls,
+              timelineEvidence: extractPrimeTimelineEvidence(json),
+            })
           }
         }
         // playerChromeResources
@@ -202,7 +211,10 @@ async function main() {
               },
             } = json
 
-            playbackUrlsQueue.add(titleId, playbackUrls)
+            playbackUrlsQueue.add(titleId, {
+              playbackUrls,
+              timelineEvidence: extractPrimeTimelineEvidence(json),
+            })
           }
         }
         // playerChromeResources
