@@ -102,6 +102,22 @@ describe('Prime Main/Remote content boundaries', () => {
 })
 
 describe('Prime dynamic media duration alignments', () => {
+  test('reported 1457.032s / 504.910584s sample lies inside the existing first-break window', () => {
+    const session = tracker()
+    session.sample(1425, 0)
+    const first = session.sample(1457.032, 504.910584)
+    expect(first.diagnostics.status).toBe('tracking')
+    expect(first.diagnostics.confirmedBreakCount).toBe(1)
+    expect(first.diagnostics.cumulativeInsertionMs).toBe(32032)
+    expect(mapped(first, 492158)).toBe(524190)
+    // Latest second duration, with an illustrative position from the earlier
+    // observation. The user has not supplied this run's second event position.
+    const second = session.sample(1506.081, 1200.543033)
+    expect(second.diagnostics.status).toBe('tracking')
+    expect(second.diagnostics.confirmedBreakCount).toBe(2)
+    expect(second.diagnostics.cumulativeInsertionMs).toBe(81081)
+    expect(mapped(second, 1117574)).toBe(1198655)
+  })
   test('E: baseline duration produces only identity start and leaves comment times alone', () => {
     const result = tracker().sample(1425, 0)
     expect(result.providerTimeline).toEqual({
@@ -174,16 +190,114 @@ describe('Prime dynamic media duration alignments', () => {
     close.sample(1425, 0)
     expect(close.sample(1457.782, 501).providerTimeline).toBeUndefined()
   })
-  test('additional chunks at a confirmed break disable rather than misassign to next break', () => {
+  test('additional chunks amend only the latest active break without advancing its count', () => {
     const session = tracker()
     session.sample(1425, 0)
-    session.sample(1457.782, 492.158)
-    expect(session.sample(1465, 530).providerTimeline).toBeUndefined()
+    const partial = session.sample(1456, 492.158)
+    expect(partial.diagnostics.confirmedBreakCount).toBe(1)
+    const first = session.sample(1457.032, 504.910584)
+    expect(first.diagnostics.confirmedBreakCount).toBe(1)
+    expect(mapped(first, 492158)).toBe(524190)
+    session.sample(1457.032, 1148.94, 'timeupdate')
+    const second = session.sample(1502, 1148.94)
+    expect(second.diagnostics.confirmedBreakCount).toBe(2)
+    const amended = session.sample(1506.081, 1200.543033)
+    expect(amended.diagnostics.status).toBe('tracking')
+    expect(amended.diagnostics.confirmedBreakCount).toBe(2)
+    expect(mapped(amended, 1117574)).toBe(1198655)
+    expect(mapped(amended, 492158)).toBe(524190)
   })
   test('duplicate unchanged samples do not confirm additional breaks', () => {
     const session = tracker()
     session.sample(1425, 0)
     const first = session.sample(1457.782, 492.158)
-    expect(session.sample(1457.782, 800)).toEqual(first)
+    const again = session.sample(1457.782, 800, 'timeupdate')
+    expect(again.providerTimeline).toEqual(first.providerTimeline)
+    expect(again.diagnostics.confirmedBreakCount).toBe(1)
+  })
+  test('clock reset with a unique preceding sample defers then confirms each variable break', () => {
+    const session = tracker()
+    session.sample(1425, 0)
+    session.sample(1425, 490, 'timeupdate')
+    const pending = session.sample(1457.032, 0.907524)
+    expect(pending.diagnostics.status).toBe('tracking')
+    expect(pending.diagnostics.reason).toBe('awaiting-break-position')
+    expect(pending.diagnostics.confirmedBreakCount).toBe(0)
+    expect(pending.diagnostics.cumulativeInsertionMs).toBe(32032)
+    expect(pending.diagnostics.confirmedCumulativeInsertionMs).toBe(0)
+    expect(mapped(pending, 492158)).toBe(492158)
+    session.sample(1457.032, 1, 'timeupdate')
+    const first = session.sample(1457.032, 504.910584, 'pause')
+    expect(first.diagnostics.confirmedBreakCount).toBe(1)
+    expect(mapped(first, 492158)).toBe(524190)
+    session.sample(1457.032, 1148.94, 'timeupdate')
+    const later = session.sample(1506.081, 0.2)
+    expect(later.diagnostics.pendingBreakIndex).toBe(1)
+    expect(later.diagnostics.confirmedBreakCount).toBe(1)
+    expect(mapped(later, 1117574)).toBe(1149606)
+    const second = session.sample(1506.081, 1200.543033, 'playing')
+    expect(second.diagnostics.status).toBe('tracking')
+    expect(second.diagnostics.confirmedBreakCount).toBe(2)
+    expect(mapped(second, 1117574)).toBe(1198655)
+  })
+  test('sealed break cannot be recaptured by later duration growth or a seek', () => {
+    for (const event of ['timeupdate', 'seeking', 'seeked']) {
+      const session = tracker()
+      session.sample(1425, 0)
+      session.sample(1456, 492.158)
+      session.sample(1456, event === 'timeupdate' ? 800 : 492.158, event)
+      expect(
+        session.sample(1457.032, 504.910584).providerTimeline
+      ).toBeUndefined()
+    }
+  })
+  test('a pending insertion is rejected on seeking, decreasing duration or skipped ownership', () => {
+    for (const [duration, position, event, reason] of [
+      [1457.032, 504.910584, 'seeking', 'ambiguous-playback-seek'],
+      [1457.032, 504.910584, 'seeked', 'ambiguous-playback-seek'],
+      [1456, 0, 'durationchange', 'duration-decreased'],
+      [1457.032, 1200, 'timeupdate', 'ambiguous-duration-growth'],
+    ]) {
+      const session = tracker()
+      session.sample(1425, 0)
+      session.sample(1425, 490, 'timeupdate')
+      session.sample(1457.032, 0.907524)
+      const result = session.sample(duration, position, event)
+      expect(result.providerTimeline).toBeUndefined()
+      expect(result.diagnostics.reason).toBe(reason)
+    }
+  })
+  test('a seek removes the preceding-position hint before a transient reset', () => {
+    const session = tracker()
+    session.sample(1425, 0)
+    session.sample(1425, 490, 'timeupdate')
+    session.sample(1425, 490, 'seeking')
+    expect(session.sample(1457.032, 0.907524).providerTimeline).toBeUndefined()
+  })
+  test('timeupdate during an unfinished seek cannot restore ownership or promote growth', () => {
+    const session = tracker()
+    session.sample(1425, 0)
+    session.sample(1425, 490, 'timeupdate')
+    session.sample(1425, 490, 'seeking')
+    session.sample(1425, 490, 'timeupdate')
+    const result = session.sample(1457.032, 0.907524)
+    expect(result.diagnostics.reason).toBe('ambiguous-playback-seek')
+    expect(result.providerTimeline).toBeUndefined()
+    expect(
+      session.sample(1457.032, 504.910584, 'pause').providerTimeline
+    ).toBeUndefined()
+    expect(
+      session.sample(1457.032, 504.910584, 'seeked').providerTimeline
+    ).toBeUndefined()
+  })
+  test('diagnostics record the sampled clock and event instead of inferring a later console value', () => {
+    const session = tracker()
+    session.sample(1425, 0)
+    const result = session.sample(1457.032, 504.910584)
+    expect(result.diagnostics.event).toBe('durationchange')
+    expect(result.diagnostics.mediaCurrentTimeMs).toBe(504910.584)
+    expect(result.diagnostics.previousMediaCurrentTimeMs).toBe(0)
+    expect(result.diagnostics.candidateBreakIndices).toEqual([0])
+    expect(result.diagnostics.sourceBreakTimesMs).toEqual([492158, 1117574])
   })
 })

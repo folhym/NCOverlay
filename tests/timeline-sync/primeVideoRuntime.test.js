@@ -122,12 +122,16 @@ mock.module('@/messaging/page', () => ({ async sendPageMessage() {
 class Video extends EventTarget {
   duration = 1425; currentTime = 0; readyState = 0; paused = true
   src = 'blob:fixture'; visible = true; durationListeners = new Set()
+  nativeListeners = new Map()
   addEventListener(type, callback, ...args) {
     if (type === 'durationchange') this.durationListeners.add(callback)
+    if (!this.nativeListeners.has(type)) this.nativeListeners.set(type, new Set())
+    this.nativeListeners.get(type).add(callback)
     return super.addEventListener(type, callback, ...args)
   }
   removeEventListener(type, callback, ...args) {
     if (type === 'durationchange') this.durationListeners.delete(callback)
+    this.nativeListeners.get(type)?.delete(callback)
     return super.removeEventListener(type, callback, ...args)
   }
   checkVisibility() { return this.visible }
@@ -171,6 +175,10 @@ async function change(duration, position, video = selectedVideo) {
   video.duration = duration; video.currentTime = position
   video.dispatchEvent(new Event('durationchange')); await flush()
 }
+async function native(event, position, video = selectedVideo) {
+  video.currentTime = position
+  video.dispatchEvent(new Event(event)); await flush()
+}
 function positions() { return patcher.nco.renderer.threads[0].comments.map(comment => comment.vposMs) }
 async function first() { await change(1457.782, mode === 'after' ? 526.13374 : 490.876409) }
 await load()
@@ -182,7 +190,137 @@ if (mode === 'initial-unknown') {
   assert.equal(selectedVideo.durationListeners.size, 1)
   assert.equal([...selectedVideo.durationListeners][0], durationListener)
 }
-if (['movie', 'catalog-unknown', 'catalog-lowercase', 'catalog-missing'].includes(mode)) {
+if (['observed-growth', 'chunked-growth', 'delayed-clock', 'early-growth',
+  'sealed-break', 'seek-recapture', 'observed-switch', 'separate-video',
+  'delayed-without-prior', 'pending-seek', 'seek-in-progress'].includes(mode)) {
+  assert.equal((await info()).providerTimeline.alignments.length, 1)
+  await seed()
+  const searchCount = searches, original = await info(), raw = JSON.stringify(await state().get('slots'))
+  const syncLogs = () => logs.filter(([event]) => event === 'primeVideo.timelineSync')
+  const assertFirst = async (count = 2) => {
+    const timeline = (await info()).providerTimeline
+    assert.equal(timeline.alignments.length, count)
+    assert.equal(timeline.alignments[1].sourceTimeMs, 492158)
+    assert.equal(timeline.alignments[1].targetTimeMs, 524190)
+    assert.equal(syncLogs().at(-1)[1].confirmedBreakCount, count - 1)
+  }
+  const assertDisabled = async () => {
+    assert.equal((await info()).providerTimeline, undefined)
+    assert.deepEqual(positions(), [497158, 1122574])
+    assert.equal(syncLogs().at(-1)[1].status, 'disabled')
+  }
+  if (mode === 'early-growth') {
+    await native('timeupdate', 10)
+    await change(1457.032, 10)
+    await assertDisabled()
+  } else if (mode === 'delayed-without-prior') {
+    await change(1457.032, 0.907524)
+    await assertDisabled()
+    await native('pause', 504.910584)
+    await assertDisabled()
+  } else if (mode === 'seek-in-progress') {
+    await native('timeupdate', 490)
+    await native('seeking', 490)
+    await native('timeupdate', 490)
+    await change(1457.032, 0.907524)
+    await native('pause', 504.910584)
+    await assertDisabled()
+    await native('seeked', 504.910584)
+    await assertDisabled()
+  } else if (mode === 'delayed-clock' || mode === 'pending-seek') {
+    await native('timeupdate', 490)
+    await change(1457.032, 0.907524)
+    assert.equal((await info()).providerTimeline.alignments.length, 1, 'Clock reset waits for same-boundary ownership')
+    assert.equal(syncLogs().at(-1)[1].status, 'tracking')
+    if (mode === 'pending-seek') {
+      await native('seeking', 504.910584)
+      await native('seeked', 504.910584)
+      await native('pause', 504.910584)
+      await assertDisabled()
+    } else {
+      await native('pause', 504.910584)
+      await assertFirst()
+      await native('timeupdate', 1148.940833)
+      await change(1506.081, 0.907524)
+      assert.equal((await info()).providerTimeline.alignments.length, 2)
+      assert.equal(syncLogs().at(-1)[1].confirmedBreakCount, 1)
+      await native('playing', 0.907524)
+      assert.equal((await info()).providerTimeline.alignments.length, 2)
+      // The second retry position is a synthetic ownership fixture using a
+      // historical observation; it was not measured with duration 1506.081.
+      await native('timeupdate', 1200.543033)
+      await assertFirst(3)
+    }
+  } else {
+    if (mode === 'chunked-growth') {
+      await change(1456, 504.910584)
+      assert.equal((await info()).providerTimeline.alignments[1].targetTimeMs, 523158)
+      assert.equal(syncLogs().at(-1)[1].confirmedBreakCount, 1)
+    }
+    // User-observed main video sample: cumulative insertion 32032ms.
+    await change(1457.032, 504.910584)
+    await assertFirst()
+    if (mode === 'sealed-break' || mode === 'seek-recapture') {
+      if (mode === 'sealed-break') await native('timeupdate', 530)
+      else { await native('seeking', 505); await native('seeked', 505) }
+      await change(1458, 505)
+      await assertDisabled()
+    } else {
+      if (mode === 'separate-video') {
+        const accepted = await info(), refreshes = patcher.nco.renderer.refreshes
+        const adVideo = new Video()
+        await change(76.265343, 0.907524, adVideo)
+        for (const event of ['timeupdate', 'playing', 'pause', 'seeking', 'seeked']) {
+          await native(event, 0.907524, adVideo)
+        }
+        assert.equal(adVideo.durationListeners.size, 0)
+        assert.deepEqual(await info(), accepted, 'Unbound ad video cannot update the main timeline')
+        assert.equal(patcher.nco.renderer.refreshes, refreshes)
+      }
+      if (mode === 'chunked-growth') {
+        await change(1502, 1195)
+        assert.equal((await info()).providerTimeline.alignments[2].targetTimeMs, 1194574)
+        assert.equal(syncLogs().at(-1)[1].confirmedBreakCount, 2)
+      }
+      // Final cumulative insertion 81081ms is observed. This second position
+      // is synthetic, reused only to exercise unique runtime ownership.
+      await change(1506.081, 1200.543033)
+      await assertFirst(3)
+    }
+  }
+  if (['observed-growth', 'chunked-growth', 'delayed-clock', 'observed-switch', 'separate-video'].includes(mode)) {
+    assert.equal((await info()).providerTimeline.alignments[2].sourceTimeMs, 1117574)
+    assert.equal((await info()).providerTimeline.alignments[2].targetTimeMs, 1198655)
+    assert.equal((await info()).providerTimeline.durationMs, 1506081)
+    assert.deepEqual(positions(), [529190, 1203655])
+    assert.equal(positions()[0] + patcher.nco.renderer.offset * 1000, 531190)
+    assert.equal(positions()[1] + patcher.nco.renderer.offset * 1000, 1205655)
+    const logged = syncLogs().length
+    await native('timeupdate', 1200.543033)
+    await native('timeupdate', 1200.543033)
+    assert.equal(syncLogs().length, logged, 'Unchanged timeupdate must not flood diagnostics')
+  }
+  const { providerTimeline: _a, ...preserved } = await info()
+  const { providerTimeline: _b, ...expected } = original
+  assert.deepEqual(preserved, expected)
+  assert.equal(searches, searchCount, 'Media sampling must not trigger auto search')
+  assert.equal(JSON.stringify(await state().get('slots')), raw)
+  assert.equal(await state().get('offset'), 2)
+  assert.equal((await state().get('slotDetails'))[0].offsetMs, 5000)
+  if (mode === 'observed-switch') {
+    episode = 2; await observer.callback(); await flush()
+    assert.equal((await info()).providerTimeline, undefined)
+    assert.equal(selectedVideo.durationListeners.size, 0)
+    await native('timeupdate', 1200.543033)
+    await native('pause', 1200.543033)
+    assert.equal((await info()).providerTimeline, undefined)
+    selectedVideo.duration = 1426; selectedVideo.currentTime = 0; await load()
+    assert.equal((await info()).providerTimeline.alignments.length, 1)
+    await change(1446.111, 433.975)
+    assert.equal((await info()).providerTimeline.alignments[1].sourceTimeMs, 433975)
+    assert.equal((await info()).providerTimeline.alignments[1].targetTimeMs, 454086)
+  }
+} else if (['movie', 'catalog-unknown', 'catalog-lowercase', 'catalog-missing'].includes(mode)) {
   assert.equal((await info()).providerTimeline, undefined)
   assert.equal(selectedVideo.durationListeners.size, 0)
   await seed(); await first(); assert.deepEqual(positions(), [497158, 1122574])
@@ -199,9 +337,13 @@ if (['movie', 'catalog-unknown', 'catalog-lowercase', 'catalog-missing'].include
   if (mode.startsWith('transient-')) {
     const accepted = await info()
     const durationListener = [...selectedVideo.durationListeners][0]
+    const nativeListeners = new Map([...selectedVideo.nativeListeners].map(([event, callbacks]) => [event, [...callbacks]]))
     const sameListener = () => {
       assert.equal(selectedVideo.durationListeners.size, 1)
       assert.equal([...selectedVideo.durationListeners][0], durationListener)
+      for (const [event, callbacks] of nativeListeners) {
+        assert.deepEqual([...selectedVideo.nativeListeners.get(event)], callbacks)
+      }
     }
     if (mode === 'transient-duration' || mode === 'transient-reload') {
       titleDom = 'missing'; subtitleDom = 'empty'
@@ -272,8 +414,12 @@ if (['movie', 'catalog-unknown', 'catalog-lowercase', 'catalog-missing'].include
     if (mode === 'replace-positive') selectedVideo.duration = 1506.372
     await patcher.setVideo(selectedVideo); await load()
     assert.equal(old.durationListeners.size, 0)
+    for (const callbacks of old.nativeListeners.values()) assert.equal(callbacks.size, 0)
     const accepted = await info()
     await change(1506.372, 1200, old)
+    for (const event of ['timeupdate', 'playing', 'pause', 'seeking', 'seeked']) {
+      await native(event, 1200, old)
+    }
     assert.deepEqual(await info(), accepted)
     if (mode === 'replace-positive') assert.equal(accepted.providerTimeline, undefined)
     else assert.equal(accepted.providerTimeline.alignments.length, 1)
@@ -375,6 +521,7 @@ if (!['late-response', 'context-aba'].includes(mode)) assert.deepEqual(errors, [
 const last = selectedVideo
 await patcher.dispose(); await flush()
 assert.equal(last.durationListeners.size, 0)
+for (const callbacks of last.nativeListeners.values()) assert.equal(callbacks.size, 0)
 console.log('prime-runtime-pass:' + mode)
 `
 
@@ -410,6 +557,17 @@ describe('Prime durationchange through actual runtime and renderer refresh', () 
     'initial-unknown',
     'context-aba',
     'id-switch-unknown',
+    'observed-growth',
+    'chunked-growth',
+    'delayed-clock',
+    'early-growth',
+    'sealed-break',
+    'seek-recapture',
+    'observed-switch',
+    'separate-video',
+    'delayed-without-prior',
+    'pending-seek',
+    'seek-in-progress',
   ]) {
     test(mode, () => {
       const result = Bun.spawnSync({

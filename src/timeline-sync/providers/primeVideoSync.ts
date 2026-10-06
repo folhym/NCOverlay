@@ -60,9 +60,25 @@ export interface PrimeSyncSample {
     readonly fullTitleDurationMs: number
     readonly mediaDurationMs: number | null
     readonly cumulativeInsertionMs: number | null
+    readonly confirmedCumulativeInsertionMs: number | null
+    readonly mediaCurrentTimeMs: number | null
+    readonly previousMediaCurrentTimeMs: number | null
+    readonly event: PrimeTimelineEvent
+    readonly pendingBreakIndex: number | null
+    readonly candidateBreakIndices: readonly number[]
+    readonly sourceBreakTimesMs: readonly number[]
     readonly alignments: readonly TimelineAlignment[]
   }
 }
+
+export type PrimeTimelineEvent =
+  | 'initial'
+  | 'durationchange'
+  | 'timeupdate'
+  | 'playing'
+  | 'pause'
+  | 'seeking'
+  | 'seeked'
 
 // A position tolerance for durationchange delivery, never an assumed ad length.
 const POSITION_TOLERANCE_MS = 5000
@@ -74,13 +90,22 @@ export class PrimeDurationTracker {
     { sourceTimeMs: 0, targetTimeMs: 0, reason: 'prime:start' },
   ]
   #cumulative: number | undefined
+  #observedCumulative: number | undefined
+  #previousTime: number | undefined
+  #activeBreak: number | undefined
+  #pendingBreak: number | undefined
+  #seeking = false
   #failure: string | undefined
 
   constructor(breaks: PrimeAdBreaks) {
     this.#breaks = breaks
   }
 
-  sample(durationSeconds: number, currentTimeSeconds: number): PrimeSyncSample {
+  sample(
+    durationSeconds: number,
+    currentTimeSeconds: number,
+    event: PrimeTimelineEvent = 'durationchange'
+  ): PrimeSyncSample {
     const rawDuration = durationSeconds * 1000
     const currentTime = currentTimeSeconds * 1000
     const duration =
@@ -89,6 +114,11 @@ export class PrimeDurationTracker {
       duration === null
         ? null
         : Math.round(duration - this.#breaks.fullTitleDurationMs)
+    const previousTime = this.#previousTime
+    let candidates: number[] = []
+    const seek = event === 'seeking' || event === 'seeked'
+    if (event === 'seeking') this.#seeking = true
+    else if (event === 'seeked') this.#seeking = false
 
     if (!this.#failure) {
       if (
@@ -104,37 +134,73 @@ export class PrimeDurationTracker {
       } else if (this.#cumulative === undefined) {
         if (cumulative !== 0) this.#failure = 'initial-insertion-unknown'
         else this.#cumulative = 0
-      } else if (cumulative < this.#cumulative) {
+      } else if (cumulative < (this.#observedCumulative ?? this.#cumulative)) {
         this.#failure = 'duration-decreased'
+      } else if (seek || this.#seeking) {
+        this.#activeBreak = undefined
+        if (this.#pendingBreak !== undefined || cumulative > this.#cumulative) {
+          this.#failure = 'ambiguous-playback-seek'
+        }
       } else if (cumulative > this.#cumulative) {
         const confirmed = this.#alignments.length - 1
-        // A jump must correspond uniquely to the next unconfirmed boundary.
-        // Including already confirmed breaks rejects chunked/preloaded updates.
-        const candidates = this.#breaks.sourceTimesMs.flatMap(
-          (source, index) => {
-            const prior =
-              index < confirmed
-                ? this.#alignments[index]!.targetTimeMs -
-                  this.#alignments[index]!.sourceTimeMs
-                : this.#cumulative!
-            return source + prior - POSITION_TOLERANCE_MS <= currentTime &&
-              currentTime <= source + cumulative + POSITION_TOLERANCE_MS
-              ? [index]
-              : []
-          }
-        )
-        if (candidates.length !== 1 || candidates[0] !== confirmed) {
-          this.#failure = 'ambiguous-duration-growth'
-        } else {
-          const sourceTimeMs = this.#breaks.sourceTimesMs[confirmed]!
-          this.#alignments.push({
+        candidates = this.#candidates(currentTime, cumulative)
+        const owner = candidates[0]
+        const eligible = (index: number | undefined) =>
+          index === confirmed ||
+          (index === confirmed - 1 && index === this.#activeBreak)
+        if (
+          candidates.length === 1 &&
+          eligible(owner) &&
+          (this.#pendingBreak === undefined || this.#pendingBreak === owner)
+        ) {
+          const sourceTimeMs = this.#breaks.sourceTimesMs[owner!]!
+          const alignment = {
             sourceTimeMs,
             targetTimeMs: sourceTimeMs + cumulative,
             reason: 'prime:ad-break',
-          })
+          }
+          if (owner === confirmed) this.#alignments.push(alignment)
+          else this.#alignments[owner! + 1] = alignment
+          this.#activeBreak = owner
+          this.#pendingBreak = undefined
           this.#cumulative = cumulative
-        }
+        } else if (candidates.length === 0) {
+          // A reset/stale event clock may precede the growth. Require a unique
+          // immediately preceding ownership sample; break count alone is not proof.
+          const hint =
+            this.#pendingBreak !== undefined
+              ? [this.#pendingBreak]
+              : previousTime === undefined
+                ? []
+                : this.#candidates(previousTime, this.#cumulative)
+          const index = hint[0]
+          if (
+            hint.length === 1 &&
+            eligible(index) &&
+            currentTime < this.#start(index!) - POSITION_TOLERANCE_MS
+          ) {
+            this.#pendingBreak = index
+          } else this.#failure = 'ambiguous-duration-growth'
+        } else this.#failure = 'ambiguous-duration-growth'
+      } else if (
+        this.#activeBreak !== undefined &&
+        currentTime >
+          this.#breaks.sourceTimesMs[this.#activeBreak]! +
+            this.#cumulative +
+            POSITION_TOLERANCE_MS
+      ) {
+        // Once ordinary media progress leaves this break, never reopen it using
+        // a larger later duration. Subsequent growth must belong to the next break.
+        this.#activeBreak = undefined
       }
+      if (cumulative !== null) this.#observedCumulative = cumulative
+      this.#previousTime =
+        !seek &&
+        !this.#seeking &&
+        Number.isFinite(currentTime) &&
+        currentTime >= 0
+          ? currentTime
+          : undefined
     }
 
     const alignments = this.#failure
@@ -147,14 +213,52 @@ export class PrimeDurationTracker {
           : undefined,
       diagnostics: {
         status: this.#failure ? 'disabled' : 'tracking',
-        reason: this.#failure ?? 'duration-boundaries',
+        reason:
+          this.#failure ??
+          (this.#pendingBreak === undefined
+            ? 'duration-boundaries'
+            : 'awaiting-break-position'),
         breakCount: this.#breaks.sourceTimesMs.length,
         confirmedBreakCount: alignments.length ? alignments.length - 1 : 0,
         fullTitleDurationMs: this.#breaks.fullTitleDurationMs,
         mediaDurationMs: duration,
         cumulativeInsertionMs: cumulative,
+        confirmedCumulativeInsertionMs: this.#failure
+          ? null
+          : (this.#cumulative ?? null),
+        mediaCurrentTimeMs: Number.isFinite(currentTime) ? currentTime : null,
+        previousMediaCurrentTimeMs: previousTime ?? null,
+        event,
+        pendingBreakIndex: this.#failure ? null : (this.#pendingBreak ?? null),
+        candidateBreakIndices: candidates,
+        sourceBreakTimesMs: [...this.#breaks.sourceTimesMs],
         alignments,
       },
     }
+  }
+
+  #start(index: number) {
+    const confirmed = this.#alignments.length - 1
+    const prior =
+      index < confirmed
+        ? this.#alignments[index]!.targetTimeMs -
+          this.#alignments[index]!.sourceTimeMs
+        : this.#cumulative!
+    return this.#breaks.sourceTimesMs[index]! + prior
+  }
+
+  #candidates(currentTime: number, cumulative: number) {
+    const confirmed = this.#alignments.length - 1
+    return this.#breaks.sourceTimesMs.flatMap((source, index) => {
+      const endOffset =
+        index < confirmed && index !== this.#activeBreak
+          ? this.#alignments[index + 1]!.targetTimeMs -
+            this.#alignments[index + 1]!.sourceTimeMs
+          : cumulative
+      return this.#start(index) - POSITION_TOLERANCE_MS <= currentTime &&
+        currentTime <= source + endOffset + POSITION_TOLERANCE_MS
+        ? [index]
+        : []
+    })
   }
 }

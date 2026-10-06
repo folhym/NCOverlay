@@ -1,12 +1,22 @@
 import type { NCOverlay } from '@/ncoverlay'
 import type { StateInfo } from '@/ncoverlay/state'
 import type { ProviderTimeline } from '@/timeline-sync/core'
+import type { PrimeTimelineEvent } from './primeVideoSync'
 
 import equal from 'fast-deep-equal'
 
 import { logger } from '@/utils/logger'
 
 import { PrimeDurationTracker, findPrimeAdBreaks } from './primeVideoSync'
+
+const MEDIA_EVENTS = [
+  'durationchange',
+  'timeupdate',
+  'playing',
+  'pause',
+  'seeking',
+  'seeked',
+] as const
 
 /** Prime-only listener/state ownership; shared Patcher and video events stay intact. */
 export class PrimeVideoTimelineSession {
@@ -25,6 +35,7 @@ export class PrimeVideoTimelineSession {
   #infoIdentity: string | undefined
   #removeInfoListener: (() => void) | undefined
   #pending: Promise<void> = Promise.resolve()
+  #loggedDecision: string | undefined
 
   get version() {
     return this.#version
@@ -68,7 +79,9 @@ export class PrimeVideoTimelineSession {
     const context = this.#getContext()
     const version = ++this.#version
     this.#active = false
-    this.#nco.video.removeEventListener('durationchange', this.#durationChange)
+    for (const event of MEDIA_EVENTS) {
+      this.#nco.video.removeEventListener(event, this.#mediaEvent)
+    }
     this.#removeInfoListener?.()
     this.#removeInfoListener = undefined
     this.#infoIdentity = undefined
@@ -119,11 +132,13 @@ export class PrimeVideoTimelineSession {
     this.#expectedDuration = Math.floor(
       (breaks?.fullTitleDurationMs ?? 0) / 1000
     )
-    this.#sample()
+    this.#sample('initial')
     this.#initialTimeline = this.#timeline
     this.#active = !!this.#tracker
     if (this.#active) {
-      this.#nco.video.addEventListener('durationchange', this.#durationChange)
+      for (const event of MEDIA_EVENTS) {
+        this.#nco.video.addEventListener(event, this.#mediaEvent)
+      }
       this.#removeInfoListener = this.#nco.state.onChange('info', (info) => {
         if (!info) {
           void this.pause(true, false)
@@ -159,20 +174,40 @@ export class PrimeVideoTimelineSession {
       .catch((error) => logger.error('primeVideo.timelineSync', error))
   }
 
-  #sample() {
+  #sample(event: PrimeTimelineEvent) {
     const sample = this.#tracker?.sample(
       this.#nco.video.duration,
-      this.#nco.video.currentTime
+      this.#nco.video.currentTime,
+      event
     )
     this.#timeline = sample?.providerTimeline
-    if (sample) logger.log('primeVideo.timelineSync', sample.diagnostics)
+    if (sample) {
+      const { diagnostics } = sample
+      // Clock samples support ownership, but never produce timeupdate log spam.
+      const decision = JSON.stringify([
+        diagnostics.status,
+        diagnostics.reason,
+        diagnostics.mediaDurationMs,
+        diagnostics.confirmedBreakCount,
+        diagnostics.pendingBreakIndex,
+        diagnostics.alignments,
+      ])
+      if (
+        event === 'initial' ||
+        event === 'durationchange' ||
+        decision !== this.#loggedDecision
+      ) {
+        logger.log('primeVideo.timelineSync', diagnostics)
+        this.#loggedDecision = decision
+      }
+    }
   }
 
-  #durationChange = () => {
+  #mediaEvent = (event: Event) => {
     this.checkContext()
     if (!this.#active || !this.isCurrent(this.#version)) return
     const previous = this.#timeline
-    this.#sample()
+    this.#sample(event.type as PrimeTimelineEvent)
     if (!equal(previous, this.#timeline)) this.#updateInfo()
   }
 
