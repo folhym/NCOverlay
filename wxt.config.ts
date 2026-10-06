@@ -50,7 +50,7 @@ export default defineConfig({
     }
 
     return {
-      name: displayName,
+      name: 'NCOverlay Sync',
       description,
       default_locale: 'ja',
       homepage_url: GITHUB_URL,

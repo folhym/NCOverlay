@@ -83,7 +83,7 @@ void (async () => {
       thumbObjUrl = URL.createObjectURL(blob)
     }
 
-    document.title = `${title} | NCOverlay`
+    document.title = `${title} | NCOverlay Sync`
     navigator.mediaSession.metadata = new MediaMetadata({
       title,
       artist: 'NCOverlay',
