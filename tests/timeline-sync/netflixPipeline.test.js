@@ -2,8 +2,8 @@ import { describe, expect, test } from 'bun:test'
 
 // Each probe imports the actual Netflix entrypoint, Patcher, State and Core.
 // Browser IO and NCOverlay's canvas/event shell are fixtures in an isolated
-// process. Synthetic metadata does not establish Netflix marker semantics,
-// field units, or real browser/API/playback behavior.
+// process. Credit values use the user's reported playback observations; these
+// fixtures do not independently prove field semantics or real playback.
 const netflixProbe = String.raw`
 import assert from 'node:assert/strict'
 import { mock } from 'bun:test'
@@ -68,6 +68,7 @@ mock.module('@/messaging/extension', () => ({
 }))
 
 const { NCOState } = await import('./src/ncoverlay/state.ts')
+const { createCommentTimelinePlan } = await import('./src/timeline-sync/commentTimeline.ts')
 class OverlayFixture {
   constructor(id, video) {
     this.id = id; this.video = video; this.canvas = {}
@@ -144,20 +145,23 @@ function episodeMetadata() {
     seasons: [{
       id: 101, title: 'Synthetic Season', episodes: [
         { id: 201, episodeId: 202, title: 'Episode A', seq: 1, runtime: 1500,
-          creditsOffset: 1400,
-          skipMarkers: { credit: { start: 100, end: 150 }, recap: { start: 0, end: 12 } } },
+          creditsOffset: 1335,
+          skipMarkers: { credit: { start: 57057, end: 144978 }, recap: { start: 0, end: 12 } } },
         { id: 202, episodeId: 201, title: 'Episode B', seq: 2, runtime: 1600,
-          skipMarkers: { credit: { start: 200, end: 250 } } },
+          creditsOffset: 1331,
+          skipMarkers: { credit: { start: 139013, end: 226976 } } },
       ],
     }],
   })
 }
 function movieMetadata(withOptionalFields = true) {
+  // Synthetic movie input reuses the confirmed field contract; this is not a
+  // separate movie playback observation.
   return deepFreeze({
     id: 201, type: 'movie', title: 'Synthetic Movie',
     ...(withOptionalFields ? {
       runtime: 1400, creditsOffset: 1300,
-      skipMarkers: { credit: { start: 15, end: 85 }, recap: { start: null, end: null } },
+      skipMarkers: { credit: { start: 57057, end: 144978 }, recap: { start: null, end: null } },
     } : {}),
   })
 }
@@ -179,39 +183,66 @@ function infoWrites() {
 }
 function diagnostics() {
   return logs.filter(([event]) => event === 'netflix.providerTimeline')
-    .map(([, value]) => {
-      assert.equal(value.providerTimeline, null)
-      return value.diagnostics
-    })
+    .map(([, value]) => value.diagnostics)
 }
-function markerThreads() {
-  return [{ id: 'fixture-thread', fork: 'main', commentCount: 6,
-    comments: ['A', 'B'].flatMap((body, index) =>
+function expectedTimeline(id = 201, mediaSeconds = 1500.5) {
+  const times = id === 201 ? [57057, 144978] : [139013, 226976]
+  return { anchors: [
+    { key: 'op', timeMs: times[0] }, { key: 'aPart', timeMs: times[1] },
+  ], durationMs: mediaSeconds * 1000 }
+}
+function assertReadyInfo(info, id = 201, mediaSeconds = 1500.5) {
+  assert.deepEqual(info.providerTimeline, expectedTimeline(id, mediaSeconds))
+  const diagnostic = diagnostics().at(-1)
+  assert.equal(diagnostic.status, 'ready')
+  assert.equal(diagnostic.fields.credit.status, 'confirmed')
+  assert.equal(diagnostic.fields.credit.startRaw, info.providerTimeline.anchors[0].timeMs)
+  assert.equal(diagnostic.fields.credit.endRaw, info.providerTimeline.anchors[1].timeMs)
+  assert.equal(diagnostic.fields.creditsOffsetRaw, id === 202 ? 1331 : mode === 'movie' ? 1300 : 1335)
+  const payload = logs.filter(([event]) => event === 'netflix.providerTimeline').at(-1)[1]
+  assert.deepEqual(payload.providerTimeline, info.providerTimeline)
+}
+const rawPositions = { OP: 55000, A: 135000, B: 815000 }
+const mappedPositions = {
+  201: { OP: 62057, A: 149978, B: 829978 },
+  202: { OP: 144013, A: 231976, B: 911976 },
+}
+function markerThreads(omit) {
+  const groups = [['OP', 50000], ['A', 130000], ['B', 810000]]
+    .filter(([body]) => body !== omit)
+  return [{ id: 'fixture-thread', fork: 'main', commentCount: groups.length * 3,
+    comments: groups.flatMap(([body, vposMs]) =>
       Array.from({ length: 3 }, (_, count) => ({
-        id: body + count, body, vposMs: index ? 810000 : 180000,
+        id: body + count, body, vposMs,
         commands: [], isPremium: false, userId: 'fixture', score: 0,
       }))
     ),
   }]
 }
-async function seedManualOffsets(state) {
-  await state.set('slots', [{ id: 'fixture-slot', threads: markerThreads(), isAutoLoaded: false }])
+async function seedManualOffsets(state, omit) {
+  await state.set('slots', [{ id: 'fixture-slot', threads: markerThreads(omit), isAutoLoaded: false }])
   await state.set('slotDetails', [{ id: 'fixture-slot', type: 'official', status: 'ready', offsetMs: 5000, isAutoLoaded: false }])
   await state.set('offset', 2)
 }
-async function assertUncorrectedPipeline(state) {
+async function assertDisplayPipeline(state, expected = rawPositions) {
   const raw = JSON.stringify(await state.get('slots'))
   const initialWrites = writes.length
   const first = await state.getThreads()
   const second = await state.getThreads()
-  const bPositions = first.flatMap(thread => thread.comments).filter(comment => comment.body === 'B').map(comment => comment.vposMs)
-  assert.deepEqual(bPositions, [815000, 815000, 815000])
+  const comments = first.flatMap(thread => thread.comments)
+  for (const [body, time] of Object.entries(expected)) {
+    const positions = comments.filter(comment => comment.body === body).map(comment => comment.vposMs)
+    assert.deepEqual(positions, [time, time, time])
+  }
+  assert.equal(comments.length, Object.keys(expected).length * 3)
   assert.deepEqual(second, first)
   assert.equal(JSON.stringify(await state.get('slots')), raw)
   assert.equal(await state.get('offset'), 2)
   assert.equal((await state.get('slotDetails'))[0].offsetMs, 5000)
   assert.equal(writes.length, initialWrites)
-  assert.equal(bPositions[0] + (await state.get('offset')) * 1000, 817000)
+  // Renderer composition is arithmetic here, not a browser rendering check.
+  const bTime = comments.find(comment => comment.body === 'B').vposMs
+  assert.equal(bTime + (await state.get('offset')) * 1000, expected.B + 2000)
 }
 
 if (['commit-route', 'commit-clear', 'commit-null'].includes(mode)) {
@@ -232,12 +263,14 @@ if (['commit-route', 'commit-clear', 'commit-null'].includes(mode)) {
   assert.deepEqual(infoWrites(), [])
   assert.equal(await patcher.nco.state.get('info'), null)
   assert.deepEqual(errors, [])
-} else if (['episode', 'movie', 'missing', 'null'].includes(mode)) {
-  const metadata = mode === 'episode' ? episodeMetadata()
+} else if (['episode', 'movie', 'missing', 'null', 'missing-op', 'missing-a'].includes(mode)) {
+  const ready = ['episode', 'movie', 'missing-op', 'missing-a'].includes(mode)
+  const metadata = mode === 'episode' || mode.startsWith('missing-') ? episodeMetadata()
     : mode === 'null' ? null : movieMetadata(mode !== 'missing')
   await completeLoad(metadata)
   const info = await patcher.nco.state.get('info')
-  assert.equal(info.providerTimeline, undefined)
+  if (ready) assertReadyInfo(info)
+  else assert.equal(info.providerTimeline, undefined)
   assert.equal(info.duration, mode === 'movie' ? 1390 : mode === 'null' ? 0 : 1490)
   if (mode === 'episode') {
     assert.ok(infoInput(info).includes('Episode A'))
@@ -248,9 +281,20 @@ if (['commit-route', 'commit-clear', 'commit-null'].includes(mode)) {
     assert.ok(diagnostic, 'Actual entrypoint must log safe timeline diagnostics')
     assert.equal(diagnostic.mediaDurationMs, 1500500)
     assert.equal(diagnostic.fields.runtimeRaw, mode === 'missing' ? null : mode === 'movie' ? 1400 : 1500)
+    if (!ready) assert.equal(diagnostic.status, 'credit-unavailable')
   }
-  await seedManualOffsets(patcher.nco.state)
-  await assertUncorrectedPipeline(patcher.nco.state)
+  const omit = mode === 'missing-op' ? 'OP' : mode === 'missing-a' ? 'A' : undefined
+  await seedManualOffsets(patcher.nco.state, omit)
+  if (omit) {
+    const slot = (await patcher.nco.state.get('slots'))[0]
+    const detail = (await patcher.nco.state.get('slotDetails'))[0]
+    const plan = createCommentTimelinePlan(slot.threads, detail, info.providerTimeline)
+    assert.equal(plan.status, 'unavailable')
+    assert.equal(plan.reason, 'insufficient-shared-anchors')
+  }
+  const expected = omit ? Object.fromEntries(Object.entries(rawPositions).filter(([body]) => body !== omit))
+    : ready ? mappedPositions[201] : rawPositions
+  await assertDisplayPipeline(patcher.nco.state, expected)
   assert.deepEqual(errors, [])
 } else if (mode === 'invalidate') {
   await completeLoad(episodeMetadata())
@@ -267,7 +311,7 @@ if (['commit-route', 'commit-clear', 'commit-null'].includes(mode)) {
   assert.deepEqual(mapped, [725000, 725000, 725000])
   globalThis.location.pathname = '/watch/202'; await observer.callback()
   assert.equal(await state.get('info'), null)
-  await assertUncorrectedPipeline(state)
+  await assertDisplayPipeline(state)
   assert.deepEqual(errors, [])
 } else if (mode === 'reverse' || mode === 'switch') {
   const firstOverlay = patcher.nco
@@ -284,10 +328,13 @@ if (['commit-route', 'commit-clear', 'commit-null'].includes(mode)) {
   second.request.resolve(episodeMetadata()); await second.pending
   const accepted = await patcher.nco.state.get('info')
   assert.ok(infoInput(accepted).includes('Episode B'))
+  assertReadyInfo(accepted, 202, mode === 'switch' ? 1700 : 1500.5)
   first.request.resolve(episodeMetadata()); await first.pending
   assert.deepEqual(await patcher.nco.state.get('info'), accepted)
   assert.ok(infoWrites().every(info => !infoInput(info).includes('Episode A')))
   assert.ok(errors.some(message => /stale/i.test(message)))
+  await seedManualOffsets(patcher.nco.state)
+  await assertDisplayPipeline(patcher.nco.state, mappedPositions[202])
 } else if (mode === 'aba' || mode === 'clear') {
   const { pending, request } = await startLoad()
   if (mode === 'aba') {
@@ -306,10 +353,10 @@ if (['commit-route', 'commit-clear', 'commit-null'].includes(mode)) {
   selectedVideo.duration = 1510
   const { pending, request } = await startLoad(patcher.nco, 'reload')
   request.resolve(episodeMetadata()); await pending
-  assert.equal((await patcher.nco.state.get('info')).providerTimeline, undefined)
+  assertReadyInfo(await patcher.nco.state.get('info'), 201, 1510)
   assert.equal((await patcher.nco.state.get('info')).duration, 1490)
   assert.equal(diagnostics().at(-1).mediaDurationMs, 1510000)
-  await assertUncorrectedPipeline(patcher.nco.state)
+  await assertDisplayPipeline(patcher.nco.state, mappedPositions[201])
   assert.deepEqual(errors, [])
 } else {
   throw new Error('Unknown Netflix pipeline fixture: ' + mode)
@@ -334,11 +381,11 @@ const cases = [
   ],
   [
     'episode',
-    'exact episode uses its metadata while unresolved anchors pass through',
+    'exact episode credit maps OP and A through the actual display pipeline',
   ],
   [
     'movie',
-    'movie metadata passes through without invented OP or ED boundaries',
+    'movie credit maps OP and A while keeping search and media durations separate',
   ],
   [
     'missing',
@@ -347,6 +394,14 @@ const cases = [
   [
     'null',
     'missing metadata safely leaves the original display pipeline usable',
+  ],
+  [
+    'missing-op',
+    'missing source OP marker preserves raw times and manual offsets',
+  ],
+  [
+    'missing-a',
+    'missing source A marker preserves raw times and manual offsets',
   ],
   [
     'reverse',

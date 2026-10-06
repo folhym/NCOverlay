@@ -11,8 +11,8 @@ interface NetflixTimelineSource {
   readonly episode?: Episode
 }
 
-interface UnverifiedRange {
-  readonly status: 'unverified' | 'missing' | 'invalid'
+interface NetflixMarkerRange {
+  readonly status: 'confirmed' | 'unverified' | 'missing' | 'invalid'
   readonly startRaw: number | null
   readonly endRaw: number | null
 }
@@ -21,16 +21,17 @@ export interface NetflixTimelineInspection {
   readonly providerTimeline?: ProviderTimeline
   readonly diagnostics: {
     readonly status:
-      | 'awaiting-field-verification'
+      | 'ready'
+      | 'credit-unavailable'
       | 'invalid-media-duration'
       | 'content-id-mismatch'
     readonly mediaDurationMs: number | null
     readonly fields: {
       readonly runtimeRaw: number | null
       readonly creditsOffsetRaw: number | null
-      readonly credit: UnverifiedRange
-      readonly recap: UnverifiedRange
-      readonly intro: UnverifiedRange
+      readonly credit: NetflixMarkerRange
+      readonly recap: NetflixMarkerRange
+      readonly intro: NetflixMarkerRange
     }
   }
 }
@@ -88,7 +89,7 @@ function rawTime(value: unknown): number | null {
     : null
 }
 
-function inspectRange(value: unknown): UnverifiedRange {
+function inspectRange(value: unknown): NetflixMarkerRange {
   if (!isRecord(value)) {
     return {
       status: value == null ? 'missing' : 'invalid',
@@ -116,9 +117,9 @@ function inspectRange(value: unknown): UnverifiedRange {
 }
 
 /**
- * nco-utils 1.4.2 only declares numeric Netflix fields; it does not document
- * their units or correspondence to OP/A/ED. Keep them diagnostic-only until
- * verified against playback. Only HTMLMediaElement.duration is seconds here.
+ * User playback verification in two episodes confirmed skipMarkers.credit as
+ * the intro skip interval in milliseconds: start → OP, end → A part.
+ * Other metadata fields remain diagnostic-only. Media duration is in seconds.
  */
 export function inspectNetflixTimeline(
   source: Video | Episode,
@@ -133,22 +134,44 @@ export function inspectNetflixTimeline(
   const markers: Record<string, unknown> = isRecord(fields.skipMarkers)
     ? fields.skipMarkers
     : {}
+  const matchesContent = isWatchId(watchId) && fields.id === watchId
+  let credit = inspectRange(markers.credit)
+  let providerTimeline: ProviderTimeline | undefined
+
+  if (mediaDurationMs !== null && credit.status === 'unverified') {
+    if (credit.endRaw !== null && credit.endRaw > mediaDurationMs) {
+      credit = { ...credit, status: 'invalid' }
+    } else if (
+      matchesContent &&
+      credit.startRaw !== null &&
+      credit.endRaw !== null
+    ) {
+      providerTimeline = {
+        anchors: [
+          { key: 'op', timeMs: credit.startRaw },
+          { key: 'aPart', timeMs: credit.endRaw },
+        ],
+        durationMs: mediaDurationMs,
+      }
+      credit = { ...credit, status: 'confirmed' }
+    }
+  }
 
   return {
-    // No Netflix field is promoted to a trusted semantic anchor by its name.
-    providerTimeline: undefined,
+    providerTimeline,
     diagnostics: {
-      status:
-        !isWatchId(watchId) || fields.id !== watchId
-          ? 'content-id-mismatch'
-          : mediaDurationMs === null
-            ? 'invalid-media-duration'
-            : 'awaiting-field-verification',
+      status: !matchesContent
+        ? 'content-id-mismatch'
+        : mediaDurationMs === null
+          ? 'invalid-media-duration'
+          : providerTimeline
+            ? 'ready'
+            : 'credit-unavailable',
       mediaDurationMs,
       fields: {
         runtimeRaw: rawTime(fields.runtime),
         creditsOffsetRaw: rawTime(fields.creditsOffset),
-        credit: inspectRange(markers.credit),
+        credit,
         recap: inspectRange(markers.recap),
         // Not declared in nco-utils; inspect only if actually present at runtime.
         intro: inspectRange(markers.intro),
