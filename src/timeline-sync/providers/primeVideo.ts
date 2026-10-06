@@ -146,13 +146,26 @@ export function extractPrimeTimelineEvidence(
   }
 }
 
-/** Rebuild the page-message snapshot from the same allowlist before logging. */
+/** Rebuild the page-message snapshot from the same allowlist before using it. */
+export function sanitizePrimeTimelineEvidence(
+  evidence: unknown
+): PrimeTimelineEvidence {
+  const source = record(evidence)
+  return {
+    status: source.status === 'captured' ? 'captured' : 'unavailable',
+    fullTitleDurationMs: time(source.fullTitleDurationMs),
+    intraTitlePlaylist: playlist(source.intraTitlePlaylist, true),
+    transitionEvents: transitions(source.transitionEvents, true),
+  }
+}
+
+/** Static diagnostics alone never create mappings; dynamic tracking is separate. */
 export function inspectPrimeTimeline(
   evidence: unknown,
   mediaDurationSeconds: number,
   mediaCurrentTimeSeconds: number
 ): PrimeTimelineInspection {
-  const source = record(evidence)
+  const source = sanitizePrimeTimelineEvidence(evidence)
   const duration = mediaTime(mediaDurationSeconds)
   const mediaDurationMs = duration !== null && duration > 0 ? duration : null
 
@@ -167,9 +180,9 @@ export function inspectPrimeTimeline(
             : 'awaiting-field-verification',
       mediaDurationMs,
       mediaCurrentTimeMs: mediaTime(mediaCurrentTimeSeconds),
-      fullTitleDurationMs: time(source.fullTitleDurationMs),
-      intraTitlePlaylist: playlist(source.intraTitlePlaylist, true),
-      transitionEvents: transitions(source.transitionEvents, true),
+      fullTitleDurationMs: source.fullTitleDurationMs,
+      intraTitlePlaylist: source.intraTitlePlaylist,
+      transitionEvents: source.transitionEvents,
     },
   }
 }

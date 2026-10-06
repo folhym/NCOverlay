@@ -1,3 +1,4 @@
+import type { NCOverlay } from '@/ncoverlay'
 import type { VodKey } from '@/types/constants'
 
 import { defineContentScript } from '#imports'
@@ -5,6 +6,7 @@ import { parse } from '@midra/nco-utils/parse'
 import { normalize } from '@midra/nco-utils/parse/libs/normalize'
 
 import { inspectPrimeTimeline } from '@/timeline-sync/providers/primeVideo'
+import { PrimeVideoTimelineSession } from '@/timeline-sync/providers/primeVideoSession'
 import { MATCHES } from '@/constants/matches'
 import { logger } from '@/utils/logger'
 import { sleep } from '@/utils/sleep'
@@ -29,14 +31,46 @@ async function main() {
 
   logger.log('vod', vod)
 
+  const sessions = new WeakMap<NCOverlay, PrimeVideoTimelineSession>()
+  // Match the existing page resolver's context. Values are private, never logged.
+  const getContext = () =>
+    JSON.stringify([
+      location.pathname,
+      document.body.querySelector(
+        '.dv-player-fullscreen .atvwebplayersdk-title-text:not(:empty)'
+      )?.textContent,
+      document.body.querySelector(
+        '.dv-player-fullscreen :is(.atvwebplayersdk-subtitle-text, .atvwebplayersdk-episode-info)'
+      )?.textContent,
+    ])
+  const getSession = (nco: NCOverlay) => {
+    let session = sessions.get(nco)
+    if (!session) {
+      const video = nco.video
+      session = new PrimeVideoTimelineSession(
+        nco,
+        () => patcher.nco === nco && nco.video === video,
+        getContext
+      )
+      sessions.set(nco, session)
+    }
+    return session
+  }
+
   const patcher = new NCOPatcher(vod, {
-    getInfo: async (nco) => {
+    getInfo: async (nco, request) => {
+      const session = getSession(nco)
+      const drained = session.pause()
+      const version = session.version
+      request.isCurrent = () => session.isCurrent(version)
+      await drained
       await sleep(2000)
 
       const playbackInfo = await sendPageMessage(
         'page:primeVideo:getPlaybackInfo',
         null
       )
+      if (!request.isCurrent()) throw new Error('Stale Prime metadata response')
 
       const inspection = inspectPrimeTimeline(
         playbackInfo?.timelineEvidence,
@@ -86,14 +120,28 @@ async function main() {
       logger.log('episodeTitle', episodeTitle)
       logger.log('duration', duration)
 
+      const providerTimeline = session.resume(
+        playbackInfo.id,
+        playbackInfo.timelineEvidence,
+        // Playback observations cover Episodes; movies retain the normal pipeline.
+        catalog.type !== 'MOVIE' &&
+          !!catalog.seriesTitle &&
+          Number.isSafeInteger(catalog.seasonNumber) &&
+          Number.isSafeInteger(catalog.episodeNumber) &&
+          seasonNum >= 0 &&
+          episodeNum >= 0
+      )
+
       return workTitle
         ? {
             input: `${workTitle} ${episodeTitle ?? ''}`,
             duration,
+            providerTimeline,
           }
         : null
     },
     appendCanvas: (video, canvas) => {
+      if (patcher.nco) getSession(patcher.nco)
       video
         .closest('.dv-player-fullscreen')
         ?.querySelector('.atvwebplayersdk-player-container')
@@ -103,6 +151,7 @@ async function main() {
 
   const obs_config: MutationObserverInit = {
     childList: true,
+    characterData: true,
     subtree: true,
     attributes: true,
     attributeFilter: ['src'],
@@ -111,6 +160,7 @@ async function main() {
     obs.disconnect()
 
     if (patcher.nco) {
+      getSession(patcher.nco).checkContext()
       if (!patcher.nco.video.checkVisibility()) {
         await patcher.dispose()
       }
