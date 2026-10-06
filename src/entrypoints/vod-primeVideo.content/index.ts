@@ -32,17 +32,23 @@ async function main() {
   logger.log('vod', vod)
 
   const sessions = new WeakMap<NCOverlay, PrimeVideoTimelineSession>()
-  // Match the existing page resolver's context. Values are private, never logged.
-  const getContext = () =>
-    JSON.stringify([
-      location.pathname,
-      document.body.querySelector(
+  // Only complete Episode context can identify a change. Controls/ads may
+  // temporarily remove either element. Values are private, never logged.
+  const getContext = () => {
+    const title = document.body
+      .querySelector(
         '.dv-player-fullscreen .atvwebplayersdk-title-text:not(:empty)'
-      )?.textContent,
-      document.body.querySelector(
+      )
+      ?.textContent?.trim()
+    const subtitle = document.body
+      .querySelector(
         '.dv-player-fullscreen :is(.atvwebplayersdk-subtitle-text, .atvwebplayersdk-episode-info)'
-      )?.textContent,
-    ])
+      )
+      ?.textContent?.trim()
+    return title && subtitle
+      ? JSON.stringify([location.pathname, title, subtitle])
+      : null
+  }
   const getSession = (nco: NCOverlay) => {
     let session = sessions.get(nco)
     if (!session) {
@@ -124,7 +130,7 @@ async function main() {
         playbackInfo.id,
         playbackInfo.timelineEvidence,
         // Playback observations cover Episodes; movies retain the normal pipeline.
-        catalog.type !== 'MOVIE' &&
+        catalog.type === 'EPISODE' &&
           !!catalog.seriesTitle &&
           Number.isSafeInteger(catalog.seasonNumber) &&
           Number.isSafeInteger(catalog.episodeNumber) &&

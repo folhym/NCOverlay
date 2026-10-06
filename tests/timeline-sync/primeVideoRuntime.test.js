@@ -10,6 +10,8 @@ const stored = new Map(), listeners = new Map(), logs = [], errors = []
 let observer, patcher, init, capture, clock = 0, searches = 0
 const captured = new Promise(resolve => { capture = resolve })
 let episode = 1, delayedReply, blockGet, blockSet
+let titleDom = mode === 'initial-unknown' ? 'missing' : 'present'
+let subtitleDom = mode === 'initial-unknown' ? 'empty' : 'present'
 const values = {
   'comment:speed': 1, 'comment:customize': {}, 'comment:hideAssistedComments': false,
   'comment:adjustJikkyoOffset': false, 'autoSearch:jikkyoOnlyAdjustable': false,
@@ -104,7 +106,9 @@ function packet(number = episode) {
     { type: 'Main', startMs: index ? ends[index - 1] : 0, endMs: end },
   ]) }
   return { id: 'PRIVATE-ID-' + number, playbackUrls,
-    catalog: { type: mode === 'movie' ? 'MOVIE' : 'EPISODE',
+    catalog: { ...(mode === 'catalog-missing' ? {} : { type:
+      mode === 'movie' ? 'MOVIE' : mode === 'catalog-unknown' ? 'UNKNOWN' :
+      mode === 'catalog-lowercase' ? 'episode' : 'EPISODE' }),
       seriesTitle: 'PRIVATE-SERIES', title: 'PRIVATE-EPISODE-' + number,
       seasonNumber: 1, episodeNumber: number },
     timelineEvidence: extractPrimeTimelineEvidence({ vodPlaylistedPlaybackUrls: { result: { playbackUrls } } }),
@@ -135,7 +139,11 @@ globalThis.location = { pathname: '/synthetic-prime' }
 globalThis.performance = { now() { clock += 2000; return clock } }
 globalThis.document = { body: { querySelector(selector) {
   if (selector.includes('video[src]')) return selectedVideo
-  return { textContent: selector.includes('title-text:') ? 'PRIVATE-SERIES' : 'S1 E' + episode }
+  const title = selector.includes('title-text:')
+  const availability = title ? titleDom : subtitleDom
+  if (availability === 'missing') return null
+  return { textContent: availability === 'null' ? null : availability === 'empty' ? '' :
+    availability === 'whitespace' ? ' \t\n ' : title ? 'PRIVATE-SERIES' : 'S1 E' + episode }
 } } }
 globalThis.MutationObserver = class {
   constructor(callback) { observer = this; this.callback = callback }
@@ -166,7 +174,15 @@ async function change(duration, position, video = selectedVideo) {
 function positions() { return patcher.nco.renderer.threads[0].comments.map(comment => comment.vposMs) }
 async function first() { await change(1457.782, mode === 'after' ? 526.13374 : 490.876409) }
 await load()
-if (mode === 'movie') {
+if (mode === 'initial-unknown') {
+  const accepted = await info(), durationListener = [...selectedVideo.durationListeners][0]
+  titleDom = 'present'; subtitleDom = 'present'
+  await observer.callback(); await flush()
+  assert.deepEqual(await info(), accepted, 'The first valid DOM establishes a baseline')
+  assert.equal(selectedVideo.durationListeners.size, 1)
+  assert.equal([...selectedVideo.durationListeners][0], durationListener)
+}
+if (['movie', 'catalog-unknown', 'catalog-lowercase', 'catalog-missing'].includes(mode)) {
   assert.equal((await info()).providerTimeline, undefined)
   assert.equal(selectedVideo.durationListeners.size, 0)
   await seed(); await first(); assert.deepEqual(positions(), [497158, 1122574])
@@ -180,7 +196,51 @@ if (mode === 'movie') {
   assert.deepEqual(positions(), [529940, 1155356])
   assert.equal(patcher.nco.renderer.offset, 2)
   assert.equal(positions()[0] + patcher.nco.renderer.offset * 1000, 531940)
-  if (['before', 'after', 'reload'].includes(mode)) {
+  if (mode.startsWith('transient-')) {
+    const accepted = await info()
+    const durationListener = [...selectedVideo.durationListeners][0]
+    const sameListener = () => {
+      assert.equal(selectedVideo.durationListeners.size, 1)
+      assert.equal([...selectedVideo.durationListeners][0], durationListener)
+    }
+    if (mode === 'transient-duration' || mode === 'transient-reload') {
+      titleDom = 'missing'; subtitleDom = 'empty'
+    } else {
+      const [, field, availability] = mode.split('-')
+      if (field === 'title') titleDom = availability
+      else subtitleDom = availability
+    }
+    await observer.callback(); await flush()
+    sameListener()
+    assert.deepEqual(await info(), accepted, 'Unknown DOM must preserve accepted timeline and info')
+    assert.equal(searches, searchCount, 'Unknown DOM must not restart search')
+    if (mode === 'transient-duration') {
+      await change(1506.372, 1148.940833)
+      sameListener()
+      assert.equal((await info()).providerTimeline.alignments[2].targetTimeMs, 1198946)
+    } else if (mode === 'transient-reload') {
+      await load('reload')
+      sameListener()
+      assert.equal((await info()).providerTimeline.alignments[1].targetTimeMs, 524940)
+      assert.equal(searches, searchCount + 1, 'Only explicit reload may restart search')
+    }
+    const beforeRestore = await info()
+    titleDom = 'present'; subtitleDom = 'present'
+    await observer.callback(); await flush()
+    sameListener()
+    assert.deepEqual(await info(), beforeRestore, 'Restoring the same valid DOM must preserve state')
+    assert.equal(searches, searchCount + (mode === 'transient-reload' ? 1 : 0))
+    if (mode !== 'transient-duration') await change(1506.372, 1148.940833)
+    sameListener()
+    assert.equal((await info()).providerTimeline.alignments[1].targetTimeMs, 524940)
+    assert.equal((await info()).providerTimeline.alignments[2].targetTimeMs, 1198946)
+    assert.deepEqual(positions(), [529940, 1203946])
+    assert.equal(patcher.nco.renderer.offset, 2)
+    assert.equal(await state().get('offset'), 2)
+    assert.equal((await state().get('slotDetails'))[0].offsetMs, 5000)
+    assert.equal(JSON.stringify(await state().get('slots')), raw)
+    assert.equal(searches, searchCount + (mode === 'transient-reload' ? 1 : 0))
+  } else if (['before', 'after', 'reload', 'initial-unknown'].includes(mode)) {
     if (mode === 'reload') {
       await load('reload')
       assert.equal(selectedVideo.durationListeners.size, 1)
@@ -228,6 +288,26 @@ if (mode === 'movie') {
     await change(1446.111, 433.975)
     assert.equal((await info()).providerTimeline.alignments[1].sourceTimeMs, 433975)
     assert.equal((await info()).providerTimeline.alignments[1].targetTimeMs, 454086)
+  } else if (mode === 'id-switch-unknown') {
+    const oldTimeline = await info()
+    titleDom = 'missing'; subtitleDom = 'empty'; episode = 2
+    await observer.callback(); await flush()
+    assert.deepEqual(await info(), oldTimeline, 'Missing DOM alone is not a source change')
+    selectedVideo.duration = 1426; selectedVideo.currentTime = 0
+    await load('reload')
+    const accepted = await info()
+    assert.equal(accepted.duration, 1426)
+    assert.equal(accepted.providerTimeline.alignments.length, 1, 'New private ID gets a fresh baseline')
+    assert.equal(selectedVideo.durationListeners.size, 1)
+    const durationListener = [...selectedVideo.durationListeners][0]
+    titleDom = 'present'; subtitleDom = 'present'
+    await observer.callback(); await flush()
+    assert.deepEqual(await info(), accepted, 'First visible context must match the newly accepted source')
+    assert.equal([...selectedVideo.durationListeners][0], durationListener)
+    await change(1446.111, 433.975)
+    assert.equal((await info()).providerTimeline.alignments.length, 2)
+    assert.equal((await info()).providerTimeline.alignments[1].sourceTimeMs, 433975)
+    assert.equal((await info()).providerTimeline.alignments[1].targetTimeMs, 454086)
   } else if (mode === 'clear') {
     await patcher.nco.clear(); await flush()
     assert.equal(await info(), null)
@@ -248,16 +328,23 @@ if (mode === 'movie') {
     const clearing = patcher.nco.clear()
     release(); await clearing; await flush()
     assert.equal(await info(), null, 'No dispatched/queued patch may restore cleared info')
-  } else if (mode === 'late-response') {
+  } else if (mode === 'late-response' || mode === 'context-aba') {
     let release, entered
     const requested = new Promise(resolve => { entered = resolve })
     delayedReply = reply => new Promise(resolve => { release = () => resolve(reply); entered() })
     const oldLoad = patcher.nco.dispatch('reload'); await requested
     episode = 2; await observer.callback(); await flush()
-    delayedReply = null; selectedVideo.duration = 1426; selectedVideo.currentTime = 0
+    if (mode === 'context-aba') {
+      episode = 1; await observer.callback(); await flush()
+      release(); await oldLoad; await flush()
+      assert.equal((await info()).providerTimeline, undefined, 'ABA alone must invalidate the old request')
+      assert.equal(selectedVideo.durationListeners.size, 0)
+      assert.ok(errors.some(error => /Stale Prime/.test(error)))
+    }
+    delayedReply = null; selectedVideo.duration = episode === 1 ? 1425 : 1426; selectedVideo.currentTime = 0
     await load('reload')
     const accepted = await info()
-    release(); await oldLoad; await flush()
+    if (mode !== 'context-aba') { release(); await oldLoad; await flush() }
     assert.deepEqual(await info(), accepted)
     assert.ok(errors.some(error => /Stale Prime/.test(error)))
   } else if (mode === 'precommit-duration') {
@@ -284,7 +371,7 @@ for (const [event, payload] of logs) {
     assert.ok(!JSON.stringify(payload).includes('https:'))
   }
 }
-if (mode !== 'late-response') assert.deepEqual(errors, [])
+if (!['late-response', 'context-aba'].includes(mode)) assert.deepEqual(errors, [])
 const last = selectedVideo
 await patcher.dispose(); await flush()
 assert.equal(last.durationListeners.size, 0)
@@ -307,6 +394,22 @@ describe('Prime durationchange through actual runtime and renderer refresh', () 
     'commit-race',
     'precommit-duration',
     'movie',
+    'catalog-unknown',
+    'catalog-lowercase',
+    'catalog-missing',
+    'transient-title-missing',
+    'transient-title-null',
+    'transient-title-empty',
+    'transient-title-whitespace',
+    'transient-subtitle-missing',
+    'transient-subtitle-null',
+    'transient-subtitle-empty',
+    'transient-subtitle-whitespace',
+    'transient-duration',
+    'transient-reload',
+    'initial-unknown',
+    'context-aba',
+    'id-switch-unknown',
   ]) {
     test(mode, () => {
       const result = Bun.spawnSync({

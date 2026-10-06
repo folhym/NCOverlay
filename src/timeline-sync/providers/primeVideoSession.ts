@@ -12,8 +12,8 @@ import { PrimeDurationTracker, findPrimeAdBreaks } from './primeVideoSync'
 export class PrimeVideoTimelineSession {
   readonly #nco: NCOverlay
   readonly #isOwner: () => boolean
-  readonly #getContext: () => string
-  #context: string
+  readonly #getContext: () => string | null
+  #context: string | null
   #version = 0
   #active = false
   #disposed = false
@@ -33,7 +33,7 @@ export class PrimeVideoTimelineSession {
   constructor(
     nco: NCOverlay,
     isOwner: () => boolean,
-    getContext: () => string
+    getContext: () => string | null
   ) {
     this.#nco = nco
     this.#isOwner = isOwner
@@ -59,23 +59,24 @@ export class PrimeVideoTimelineSession {
       !this.#disposed &&
       this.#version === version &&
       this.#isOwner() &&
-      this.#context === this.#getContext()
+      this.#matchesContext(this.#getContext())
     )
   }
 
   /** Synchronously invalidate reads; drain dispatched writes before clear/dispose. */
   pause(dropSource = false, stripTimeline = true) {
+    const context = this.#getContext()
     const version = ++this.#version
     this.#active = false
     this.#nco.video.removeEventListener('durationchange', this.#durationChange)
     this.#removeInfoListener?.()
     this.#removeInfoListener = undefined
     this.#infoIdentity = undefined
-    if (dropSource || this.#context !== this.#getContext()) {
+    if (dropSource || !this.#matchesContext(context)) {
       this.#source = undefined
       this.#tracker = undefined
     }
-    this.#context = this.#getContext()
+    if (context !== null) this.#context = context
     if (stripTimeline) {
       this.#enqueue(async () => {
         const info = await this.#nco.state.get('info')
@@ -89,9 +90,19 @@ export class PrimeVideoTimelineSession {
     return this.#pending
   }
 
-  /** A DOM episode/route change invalidates accepted and pending evidence. */
+  /** Compare complete contexts; transient DOM loss is not a source change. */
   checkContext() {
-    if (this.#context !== this.#getContext()) void this.pause(true)
+    const context = this.#getContext()
+    if (context === null) return
+    if (!this.#matchesContext(context)) void this.pause(true)
+    else this.#context = context
+  }
+
+  #matchesContext(context: string | null) {
+    // Keep the last valid context during controls/ad DOM reconstruction.
+    return (
+      context === null || this.#context === null || context === this.#context
+    )
   }
 
   resume(id: string, evidence: unknown, enabled: boolean) {
@@ -99,6 +110,9 @@ export class PrimeVideoTimelineSession {
     // IDs remain private ownership tokens; never log them.
     const source = breaks ? JSON.stringify([id, breaks]) : undefined
     if (!source || source !== this.#source) {
+      // A newly confirmed metadata source establishes its own DOM baseline.
+      // If its labels are hidden, do not compare their return to the old source.
+      this.#context = this.#getContext()
       this.#source = source
       this.#tracker = breaks ? new PrimeDurationTracker(breaks) : undefined
     }
