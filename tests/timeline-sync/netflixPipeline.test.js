@@ -155,8 +155,8 @@ function episodeMetadata() {
   })
 }
 function movieMetadata(withOptionalFields = true) {
-  // Synthetic movie input reuses the confirmed field contract; this is not a
-  // separate movie playback observation.
+  // Standalone movie input has no verified OP/A semantics, even with the same
+  // numeric credit values as the user's episode observations.
   return deepFreeze({
     id: 201, type: 'movie', title: 'Synthetic Movie',
     ...(withOptionalFields ? {
@@ -198,7 +198,7 @@ function assertReadyInfo(info, id = 201, mediaSeconds = 1500.5) {
   assert.equal(diagnostic.fields.credit.status, 'confirmed')
   assert.equal(diagnostic.fields.credit.startRaw, info.providerTimeline.anchors[0].timeMs)
   assert.equal(diagnostic.fields.credit.endRaw, info.providerTimeline.anchors[1].timeMs)
-  assert.equal(diagnostic.fields.creditsOffsetRaw, id === 202 ? 1331 : mode === 'movie' ? 1300 : 1335)
+  assert.equal(diagnostic.fields.creditsOffsetRaw, id === 202 ? 1331 : 1335)
   const payload = logs.filter(([event]) => event === 'netflix.providerTimeline').at(-1)[1]
   assert.deepEqual(payload.providerTimeline, info.providerTimeline)
 }
@@ -263,15 +263,17 @@ if (['commit-route', 'commit-clear', 'commit-null'].includes(mode)) {
   assert.deepEqual(infoWrites(), [])
   assert.equal(await patcher.nco.state.get('info'), null)
   assert.deepEqual(errors, [])
-} else if (['episode', 'movie', 'missing', 'null', 'missing-op', 'missing-a'].includes(mode)) {
-  const ready = ['episode', 'movie', 'missing-op', 'missing-a'].includes(mode)
+} else if (['episode', 'movie', 'episode-like', 'missing', 'null', 'missing-op', 'missing-a'].includes(mode)) {
+  const ready = ['episode', 'missing-op', 'missing-a'].includes(mode)
+  const standalone = ['movie', 'episode-like', 'missing'].includes(mode)
   const metadata = mode === 'episode' || mode.startsWith('missing-') ? episodeMetadata()
+    : mode === 'episode-like' ? deepFreeze({ ...movieMetadata(), type: 'episode', episodeId: 201, seq: 1 })
     : mode === 'null' ? null : movieMetadata(mode !== 'missing')
   await completeLoad(metadata)
   const info = await patcher.nco.state.get('info')
   if (ready) assertReadyInfo(info)
   else assert.equal(info.providerTimeline, undefined)
-  assert.equal(info.duration, mode === 'movie' ? 1390 : mode === 'null' ? 0 : 1490)
+  assert.equal(info.duration, mode === 'movie' || mode === 'episode-like' ? 1390 : mode === 'null' ? 0 : 1490)
   if (mode === 'episode') {
     assert.ok(infoInput(info).includes('Episode A'))
     assert.ok(!infoInput(info).includes('Episode B'))
@@ -280,8 +282,18 @@ if (['commit-route', 'commit-clear', 'commit-null'].includes(mode)) {
     const diagnostic = diagnostics().at(-1)
     assert.ok(diagnostic, 'Actual entrypoint must log safe timeline diagnostics')
     assert.equal(diagnostic.mediaDurationMs, 1500500)
-    assert.equal(diagnostic.fields.runtimeRaw, mode === 'missing' ? null : mode === 'movie' ? 1400 : 1500)
-    if (!ready) assert.equal(diagnostic.status, 'credit-unavailable')
+    assert.equal(diagnostic.fields.runtimeRaw, mode === 'missing' ? null : standalone ? 1400 : 1500)
+    if (standalone) {
+      assert.equal(diagnostic.status, 'source-unverified')
+      assert.equal(diagnostic.fields.credit.status, mode === 'missing' ? 'missing' : 'unverified')
+      if (mode !== 'missing') {
+        assert.equal(diagnostic.fields.credit.startRaw, 57057)
+        assert.equal(diagnostic.fields.credit.endRaw, 144978)
+        assert.equal(diagnostic.fields.creditsOffsetRaw, 1300)
+      }
+      const payload = logs.filter(([event]) => event === 'netflix.providerTimeline').at(-1)[1]
+      assert.equal(payload.providerTimeline, null)
+    }
   }
   const omit = mode === 'missing-op' ? 'OP' : mode === 'missing-a' ? 'A' : undefined
   await seedManualOffsets(patcher.nco.state, omit)
@@ -385,7 +397,11 @@ const cases = [
   ],
   [
     'movie',
-    'movie credit maps OP and A while keeping search and media durations separate',
+    'standalone movie credit remains diagnostic-only and preserves raw timing',
+  ],
+  [
+    'episode-like',
+    'standalone episode-like fields do not establish verified episode semantics',
   ],
   [
     'missing',

@@ -5,11 +5,19 @@ import type {
 } from '@midra/nco-utils/types/api/netflix/metadata'
 import type { ProviderTimeline } from '@/timeline-sync/core'
 
-interface NetflixTimelineSource {
-  readonly source: Video | Episode
-  readonly season?: Season
-  readonly episode?: Episode
-}
+type NetflixTimelineSource =
+  | {
+      readonly kind: 'episode'
+      readonly source: Episode
+      readonly season: Season
+      readonly episode: Episode
+    }
+  | {
+      readonly kind: 'standalone'
+      readonly source: Video
+      readonly season?: undefined
+      readonly episode?: undefined
+    }
 
 interface NetflixMarkerRange {
   readonly status: 'confirmed' | 'unverified' | 'missing' | 'invalid'
@@ -22,6 +30,7 @@ export interface NetflixTimelineInspection {
   readonly diagnostics: {
     readonly status:
       | 'ready'
+      | 'source-unverified'
       | 'credit-unavailable'
       | 'invalid-media-duration'
       | 'content-id-mismatch'
@@ -58,7 +67,9 @@ export function selectNetflixTimelineSource(
   }
 
   if (metadata.seasons === undefined) {
-    return metadata.id === watchId ? { source: metadata } : null
+    return metadata.id === watchId
+      ? { kind: 'standalone', source: metadata }
+      : null
   }
   if (!Array.isArray(metadata.seasons)) return null
 
@@ -77,7 +88,7 @@ export function selectNetflixTimelineSource(
         entry.id === watchId &&
         typeof entry.title === 'string'
     )
-    if (episode) return { source: episode, season, episode }
+    if (episode) return { kind: 'episode', source: episode, season, episode }
   }
 
   return null
@@ -117,12 +128,13 @@ function inspectRange(value: unknown): NetflixMarkerRange {
 }
 
 /**
- * User playback verification in two episodes confirmed skipMarkers.credit as
- * the intro skip interval in milliseconds: start → OP, end → A part.
- * Other metadata fields remain diagnostic-only. Media duration is in seconds.
+ * Verification covers two Episodes of one work: credit is the intro skip
+ * interval in ms (start → OP, end → A part). Only an Episode selected from
+ * seasons may use it. Standalone Video and other fields stay diagnostic-only.
+ * Media duration is in seconds.
  */
 export function inspectNetflixTimeline(
-  source: Video | Episode,
+  selected: NetflixTimelineSource,
   watchId: number,
   mediaDurationSeconds: number
 ): NetflixTimelineInspection {
@@ -130,6 +142,8 @@ export function inspectNetflixTimeline(
   const durationMs = duration === null ? null : rawTime(duration * 1000)
   const mediaDurationMs =
     durationMs !== null && durationMs > 0 ? durationMs : null
+  const source = isRecord(selected) ? selected.source : undefined
+  const isEpisode = isRecord(selected) && selected.kind === 'episode'
   const fields: Record<string, unknown> = isRecord(source) ? source : {}
   const markers: Record<string, unknown> = isRecord(fields.skipMarkers)
     ? fields.skipMarkers
@@ -138,7 +152,7 @@ export function inspectNetflixTimeline(
   let credit = inspectRange(markers.credit)
   let providerTimeline: ProviderTimeline | undefined
 
-  if (mediaDurationMs !== null && credit.status === 'unverified') {
+  if (isEpisode && mediaDurationMs !== null && credit.status === 'unverified') {
     if (credit.endRaw !== null && credit.endRaw > mediaDurationMs) {
       credit = { ...credit, status: 'invalid' }
     } else if (
@@ -164,9 +178,11 @@ export function inspectNetflixTimeline(
         ? 'content-id-mismatch'
         : mediaDurationMs === null
           ? 'invalid-media-duration'
-          : providerTimeline
-            ? 'ready'
-            : 'credit-unavailable',
+          : !isEpisode
+            ? 'source-unverified'
+            : providerTimeline
+              ? 'ready'
+              : 'credit-unavailable',
       mediaDurationMs,
       fields: {
         runtimeRaw: rawTime(fields.runtime),

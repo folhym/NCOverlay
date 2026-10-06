@@ -8,14 +8,13 @@ import {
 } from '../../src/timeline-sync/providers/netflix'
 
 // All metadata fixtures are synthetic, with two user-reported boundary pairs
-// retained as regression values. The credit -> OP/A contract comes from the
-// user's two live episode checks; these tests do not prove browser/API behavior.
+// retained as regression values. The episode-only credit -> OP/A contract comes
+// from the user's two live checks; these tests do not prove browser/API behavior.
 const watchId = 800001
 
-function movie(overrides = {}) {
+function content(overrides = {}) {
   return {
     id: watchId,
-    type: 'movie',
     title: 'synthetic-title',
     runtime: 1500,
     creditsOffset: 1400,
@@ -25,6 +24,27 @@ function movie(overrides = {}) {
     },
     ...overrides,
   }
+}
+
+function selectedEpisode(source = content()) {
+  const selection = selectNetflixTimelineSource(
+    {
+      id: 700000,
+      title: 'synthetic-series',
+      seasons: [{ id: 700001, title: 'synthetic-season', episodes: [source] }],
+    },
+    watchId
+  )
+  expect(selection?.kind).toBe('episode')
+  return selection
+}
+
+function inspectEpisode(source, requestedWatchId, mediaDurationSeconds) {
+  return inspectNetflixTimeline(
+    selectedEpisode(source),
+    requestedWatchId,
+    mediaDurationSeconds
+  )
 }
 
 function deepFreeze(value) {
@@ -55,8 +75,8 @@ function markerThreads(markers) {
 
 describe('Netflix source selection with synthetic metadata', () => {
   test('selects the exact Episode.id rather than currentEpisode or episodeId', () => {
-    const first = { ...movie(), id: watchId - 1, episodeId: watchId }
-    const selected = { ...movie(), episodeId: watchId + 1 }
+    const first = { ...content(), id: watchId - 1, episodeId: watchId }
+    const selected = { ...content(), episodeId: watchId + 1 }
     const season = {
       id: 700001,
       title: 'synthetic-season',
@@ -72,15 +92,17 @@ describe('Netflix source selection with synthetic metadata', () => {
     const result = selectNetflixTimelineSource(metadata, watchId)
 
     expect(result?.source).toBe(selected)
+    expect(result?.kind).toBe('episode')
     expect(result?.episode).toBe(selected)
     expect(result?.season).toBe(season)
     expect(selectNetflixTimelineSource(metadata, watchId + 1)).toBeNull()
   })
 
   test('accepts standalone metadata only when its own id matches the watch id', () => {
-    const source = movie()
+    const source = content({ type: 'movie' })
     const selected = selectNetflixTimelineSource(source, watchId)
     expect(selected?.source).toBe(source)
+    expect(selected?.kind).toBe('standalone')
     expect(selected?.episode).toBeUndefined()
     expect(selected?.season).toBeUndefined()
     expect(selectNetflixTimelineSource(source, watchId + 1)).toBeNull()
@@ -88,7 +110,7 @@ describe('Netflix source selection with synthetic metadata', () => {
 
   test('does not fall back to root metadata for an unmatched episode', () => {
     const metadata = {
-      ...movie(),
+      ...content(),
       currentEpisode: watchId,
       seasons: [
         {
@@ -99,7 +121,7 @@ describe('Netflix source selection with synthetic metadata', () => {
     }
     expect(selectNetflixTimelineSource(metadata, watchId)).toBeNull()
     expect(
-      selectNetflixTimelineSource({ ...movie(), seasons: [] }, watchId)
+      selectNetflixTimelineSource({ ...content(), seasons: [] }, watchId)
     ).toBeNull()
   })
 
@@ -110,12 +132,12 @@ describe('Netflix source selection with synthetic metadata', () => {
       {},
       [],
       'invalid',
-      { ...movie(), seasons: null },
-      { ...movie(), seasons: {} },
-      { ...movie(), seasons: [null] },
-      { ...movie(), seasons: [{ episodes: null }] },
-      { ...movie(), seasons: [{ episodes: {} }] },
-      { ...movie(), seasons: [{ episodes: [null] }] },
+      { ...content(), seasons: null },
+      { ...content(), seasons: {} },
+      { ...content(), seasons: [null] },
+      { ...content(), seasons: [{ episodes: null }] },
+      { ...content(), seasons: [{ episodes: {} }] },
+      { ...content(), seasons: [{ episodes: [null] }] },
     ]) {
       expect(() => selectNetflixTimelineSource(metadata, watchId)).not.toThrow()
       expect(selectNetflixTimelineSource(metadata, watchId)).toBeNull()
@@ -124,14 +146,14 @@ describe('Netflix source selection with synthetic metadata', () => {
 
   test('requires title strings before returning values consumed by getInfo', () => {
     for (const metadata of [
-      movie({ title: undefined }),
-      movie({ title: null }),
-      movie({ seasons: [{ episodes: [movie()] }] }),
-      movie({
+      content({ title: undefined }),
+      content({ title: null }),
+      content({ seasons: [{ episodes: [content()] }] }),
+      content({
         seasons: [
           {
             title: 'synthetic-season',
-            episodes: [movie({ title: undefined })],
+            episodes: [content({ title: undefined })],
           },
         ],
       }),
@@ -142,8 +164,71 @@ describe('Netflix source selection with synthetic metadata', () => {
 })
 
 describe('Netflix confirmed credit inspection with synthetic metadata', () => {
+  test('standalone movies retain raw credit diagnostics without OP/A anchors', () => {
+    const selection = selectNetflixTimelineSource(
+      content({ type: 'movie' }),
+      watchId
+    )
+    expect(selection.kind).toBe('standalone')
+    const result = inspectNetflixTimeline(selection, watchId, 1500)
+    expect(result.providerTimeline).toBeUndefined()
+    expect(result.diagnostics.status).toBe('source-unverified')
+    expect(result.diagnostics.fields.credit).toEqual({
+      status: 'unverified',
+      startRaw: 57057,
+      endRaw: 144978,
+    })
+  })
+
+  test('flat episode labels or episode-like fields do not prove episode provenance', () => {
+    for (const source of [
+      content({ type: 'episode' }),
+      content({ episodeId: watchId, seq: 1, start: 0, end: 1500 }),
+    ]) {
+      const selection = selectNetflixTimelineSource(source, watchId)
+      expect(selection.kind).toBe('standalone')
+      const result = inspectNetflixTimeline(selection, watchId, 1500)
+      expect(result.providerTimeline).toBeUndefined()
+      expect(result.diagnostics.status).toBe('source-unverified')
+      expect(result.diagnostics.fields.credit).toEqual({
+        status: 'unverified',
+        startRaw: 57057,
+        endRaw: 144978,
+      })
+      const plan = createCommentTimelinePlan(
+        markerThreads([
+          ['OP', 100000],
+          ['A', 200000],
+        ]),
+        { type: 'official' },
+        result.providerTimeline
+      )
+      expect(plan.status).toBe('unavailable')
+      expect(mapTimelineTime(200000, plan)).toBe(200000)
+    }
+  })
+
+  test('standalone raw credit units are not compared against media ms bounds', () => {
+    const selection = selectNetflixTimelineSource(
+      content({
+        type: 'movie',
+        skipMarkers: { credit: { start: 2000000, end: 3000000 } },
+      }),
+      watchId
+    )
+    const result = inspectNetflixTimeline(selection, watchId, 1500)
+    expect(selection.kind).toBe('standalone')
+    expect(result.providerTimeline).toBeUndefined()
+    expect(result.diagnostics.status).toBe('source-unverified')
+    expect(result.diagnostics.fields.credit).toEqual({
+      status: 'unverified',
+      startRaw: 2000000,
+      endRaw: 3000000,
+    })
+  })
+
   test('A: credit creates OP/A anchors in ms while recap stays unverified', () => {
-    const result = inspectNetflixTimeline(movie(), watchId, 1500)
+    const result = inspectEpisode(content(), watchId, 1500)
 
     expect(result.providerTimeline).toEqual({
       anchors: [
@@ -166,13 +251,13 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
   })
 
   test('B: an intro-named range is not treated as an OP anchor', () => {
-    const source = movie({
+    const source = content({
       skipMarkers: {
         recap: { start: 0, end: 12 },
         intro: { start: 20, end: 100 },
       },
     })
-    const result = inspectNetflixTimeline(source, watchId, 1500)
+    const result = inspectEpisode(source, watchId, 1500)
     expect(result.providerTimeline).toBeUndefined()
     expect(result.diagnostics.status).toBe('credit-unavailable')
     expect(result.diagnostics.fields.intro).toEqual({
@@ -183,7 +268,7 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
   })
 
   test('C: media duration alone converts seconds to ms without the search -10', () => {
-    const result = inspectNetflixTimeline(movie(), watchId, 1560.5)
+    const result = inspectEpisode(content(), watchId, 1560.5)
 
     expect(result.diagnostics.mediaDurationMs).toBe(1560500)
     expect(result.diagnostics.fields.runtimeRaw).toBe(1500)
@@ -196,8 +281,8 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
       [57057, 144978],
       [139013, 226976],
     ]) {
-      const result = inspectNetflixTimeline(
-        movie({ skipMarkers: { credit: { start, end } } }),
+      const result = inspectEpisode(
+        content({ skipMarkers: { credit: { start, end } } }),
         watchId,
         1500
       )
@@ -215,11 +300,11 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
 
   test('creditsOffset, recap or intro alone cannot create provider anchors', () => {
     for (const source of [
-      movie({ skipMarkers: undefined }),
-      movie({ skipMarkers: { recap: { start: 0, end: 12000 } } }),
-      movie({ skipMarkers: { intro: { start: 15000, end: 85000 } } }),
+      content({ skipMarkers: undefined }),
+      content({ skipMarkers: { recap: { start: 0, end: 12000 } } }),
+      content({ skipMarkers: { intro: { start: 15000, end: 85000 } } }),
     ]) {
-      const result = inspectNetflixTimeline(source, watchId, 1500)
+      const result = inspectEpisode(source, watchId, 1500)
       expect(result.diagnostics.status).toBe('credit-unavailable')
       expect(result.providerTimeline).toBeUndefined()
       expect(result.diagnostics.fields.credit.status).toBe('missing')
@@ -228,9 +313,9 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
 
   test('D: absent or null optional raw fields are missing rather than zero', () => {
     for (const source of [
-      { id: watchId },
-      movie({ runtime: null, creditsOffset: null, skipMarkers: null }),
-      movie({
+      { id: watchId, title: 'synthetic-episode' },
+      content({ runtime: null, creditsOffset: null, skipMarkers: null }),
+      content({
         runtime: undefined,
         creditsOffset: undefined,
         skipMarkers: {
@@ -240,7 +325,7 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
         },
       }),
     ]) {
-      const result = inspectNetflixTimeline(source, watchId, 1500)
+      const result = inspectEpisode(source, watchId, 1500)
       expect(result.providerTimeline).toBeUndefined()
       expect(result.diagnostics.status).toBe('credit-unavailable')
       expect(result.diagnostics.fields.runtimeRaw).toBeNull()
@@ -268,9 +353,9 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
       false,
       [],
     ]) {
-      const source = movie({ skipMarkers: { credit: range, recap: range } })
-      expect(() => inspectNetflixTimeline(source, watchId, 1500)).not.toThrow()
-      const result = inspectNetflixTimeline(source, watchId, 1500)
+      const source = content({ skipMarkers: { credit: range, recap: range } })
+      expect(() => inspectEpisode(source, watchId, 1500)).not.toThrow()
+      const result = inspectEpisode(source, watchId, 1500)
       expect(result.providerTimeline).toBeUndefined()
       expect(result.diagnostics.status).toBe('credit-unavailable')
       for (const name of ['credit', 'recap']) {
@@ -284,8 +369,8 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
 
   test('invalid unrelated fields do not block valid credit anchors or get coerced', () => {
     for (const value of [-1, NaN, Infinity, -Infinity, '1500', false, {}]) {
-      const result = inspectNetflixTimeline(
-        movie({
+      const result = inspectEpisode(
+        content({
           runtime: value,
           creditsOffset: value,
           skipMarkers: {
@@ -308,8 +393,8 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
   })
 
   test('credit must end within media duration, including its exact endpoint', () => {
-    const atEnd = inspectNetflixTimeline(
-      movie({ skipMarkers: { credit: { start: 0, end: 1500000 } } }),
+    const atEnd = inspectEpisode(
+      content({ skipMarkers: { credit: { start: 0, end: 1500000 } } }),
       watchId,
       1500
     )
@@ -323,8 +408,8 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
       { start: 0, end: 1500001 },
       { start: 1500001, end: 1500002 },
     ]) {
-      const result = inspectNetflixTimeline(
-        movie({ skipMarkers: { credit } }),
+      const result = inspectEpisode(
+        content({ skipMarkers: { credit } }),
         watchId,
         1500
       )
@@ -341,8 +426,8 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
       [{ end: 10 }, null, 10],
       [{ start: 0 }, 0, null],
     ]) {
-      const result = inspectNetflixTimeline(
-        movie({ skipMarkers: { credit: range } }),
+      const result = inspectEpisode(
+        content({ skipMarkers: { credit: range } }),
         watchId,
         1500
       )
@@ -367,7 +452,7 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
       '1500',
       Number.MAX_VALUE,
     ]) {
-      const result = inspectNetflixTimeline(movie(), watchId, duration)
+      const result = inspectEpisode(content(), watchId, duration)
       expect(result.diagnostics.status).toBe('invalid-media-duration')
       expect(result.diagnostics.mediaDurationMs).toBeNull()
       expect(result.providerTimeline).toBeUndefined()
@@ -375,13 +460,13 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
   })
 
   test('mismatched content identity is reported without generating a timeline', () => {
-    const result = inspectNetflixTimeline(movie(), watchId + 1, 1500)
+    const result = inspectEpisode(content(), watchId + 1, 1500)
     expect(result.diagnostics.status).toBe('content-id-mismatch')
     expect(result.providerTimeline).toBeUndefined()
   })
 
   test('F: OP/A source markers map through the Core for official and dAnime', () => {
-    const result = inspectNetflixTimeline(movie(), watchId, 1500)
+    const result = inspectEpisode(content(), watchId, 1500)
     const threads = markerThreads([
       ['OP', 100000],
       ['A', 200000],
@@ -401,7 +486,7 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
   })
 
   test('OP-only, A-only and A/B-only source evidence remains uncorrected', () => {
-    const result = inspectNetflixTimeline(movie(), watchId, 1500)
+    const result = inspectEpisode(content(), watchId, 1500)
     for (const markers of [
       [['OP', 100000]],
       [['A', 200000]],
@@ -424,7 +509,7 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
   })
 
   test('confirmed credit does not enable broadcast, normal or file sources', () => {
-    const result = inspectNetflixTimeline(movie(), watchId, 1500)
+    const result = inspectEpisode(content(), watchId, 1500)
     const threads = markerThreads([
       ['OP', 100000],
       ['A', 200000],
@@ -441,7 +526,7 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
   })
 
   test('diagnostics contain only the declared status/numeric allowlist', () => {
-    const source = movie({
+    const source = content({
       title: 'synthetic-secret-title',
       synopsis: 'synthetic-secret-synopsis',
       cookies: 'synthetic-secret-cookie',
@@ -451,7 +536,7 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
         recap: { start: null, end: null },
       },
     })
-    const result = inspectNetflixTimeline(source, watchId, 1500)
+    const result = inspectEpisode(source, watchId, 1500)
     const { diagnostics } = result
 
     expect(Object.keys(diagnostics).sort()).toEqual([
@@ -479,7 +564,7 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
   })
 
   test('source selection and inspection do not mutate the input snapshot', () => {
-    const source = deepFreeze(movie())
+    const source = deepFreeze(content())
     const metadata = deepFreeze({
       id: 700000,
       title: 'synthetic-series',
@@ -487,7 +572,7 @@ describe('Netflix confirmed credit inspection with synthetic metadata', () => {
     })
     const before = JSON.stringify(metadata)
     const selected = selectNetflixTimelineSource(metadata, watchId)
-    inspectNetflixTimeline(selected.source, watchId, 1500)
+    inspectNetflixTimeline(selected, watchId, 1500)
 
     expect(JSON.stringify(metadata)).toBe(before)
   })

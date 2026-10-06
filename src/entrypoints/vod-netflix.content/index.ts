@@ -92,8 +92,8 @@ async function main() {
 
       if (!selected || !metadata) return null
 
-      const { source, season, episode } = selected
-      const inspection = inspectNetflixTimeline(source, id, video.duration)
+      const { season, episode } = selected
+      const inspection = inspectNetflixTimeline(selected, id, video.duration)
 
       logger.log('netflix.providerTimeline', {
         providerTimeline: inspection.providerTimeline ?? null,
