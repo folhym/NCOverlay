@@ -15,6 +15,7 @@ const logs = []
 let pageHandler
 let selectedEpisode = 1
 let resolveInit
+let patcher
 const initReady = new Promise(resolve => { resolveInit = resolve })
 const titleElem = { textContent: 'PRIVATE-SERIES-TITLE' }
 const subtitleElem = { get textContent() { return 'S1 E' + selectedEpisode + ' PRIVATE-EPISODE-' + selectedEpisode } }
@@ -30,8 +31,9 @@ mock.module('@/messaging/page', () => ({
   async sendPageMessage(name) { assert.equal(name, 'page:primeVideo:getPlaybackInfo'); return pageHandler() },
 }))
 mock.module('@/ncoverlay/patcher', () => ({ NCOPatcher: class {
-  constructor(vod, init) { assert.equal(vod, 'primeVideo'); resolveInit(init) }
+  constructor(vod, init) { patcher = this; assert.equal(vod, 'primeVideo'); resolveInit(init) }
 } }))
+globalThis.location = { pathname: '/synthetic-prime' }
 globalThis.document = { body: { querySelector() { return subtitleElem } } }
 globalThis.MutationObserver = class { observe() {} disconnect() {} }
 globalThis.window = { async fetch(input) {
@@ -138,8 +140,12 @@ if (mode === 'repeat') {
 const { default: vodScript } = await import('./src/entrypoints/vod-primeVideo.content/index.ts')
 vodScript.main()
 const init = await initReady
-const video = { duration: 1560.5, currentTime: 123.25 }
-const info = await init.getInfo({ video })
+const video = Object.assign(new EventTarget(), { duration: 1560.5, currentTime: 123.25 })
+const overlay = { video, async clear() {}, async dispose() {}, state: {
+  async get() { return null }, async set() {}, onChange() { return () => {} },
+} }
+patcher.nco = overlay
+const info = await init.getInfo(overlay, {})
 const diagnosticLogs = logs.filter(([event]) => event === 'primeVideo.timelineEvidence')
 if (mode === 'eviction') {
   assert.equal(info, null)
@@ -175,7 +181,7 @@ if (mode === 'eviction') {
     assert.deepEqual(diagnostic.transitionEvents[0].intervalStartTimesMs, [600000, 690000])
   }
   video.currentTime = 500
-  const again = await init.getInfo({ video })
+  const again = await init.getInfo(overlay, {})
   assert.deepEqual(again, info, 'A later media sample never changes searching or creates synchronization')
   assert.equal(logs.filter(([event]) => event === 'primeVideo.timelineEvidence').at(-1)[1].mediaCurrentTimeMs, 500000)
 }
