@@ -133,11 +133,19 @@ describe('Prime dynamic media duration alignments', () => {
     ]) {
       const session = tracker()
       session.sample(1425, 0)
-      const one = session.sample(1457.782, first)
+      let one = session.sample(1457.782, first)
+      if (first < 492.158) {
+        expect(one.diagnostics.confirmedBreakCount).toBe(0)
+        one = session.sample(1457.782, 492.158, 'timeupdate')
+      }
       expect(one.diagnostics.cumulativeInsertionMs).toBe(32782)
       expect(mapped(one, 492157)).toBe(492157)
       expect(mapped(one, 492158)).toBe(524940)
-      const two = session.sample(1506.372, second)
+      let two = session.sample(1506.372, second)
+      if (second < 1150.356) {
+        expect(two.diagnostics.confirmedBreakCount).toBe(1)
+        two = session.sample(1506.372, 1150.356, 'timeupdate')
+      }
       expect(two.diagnostics.cumulativeInsertionMs).toBe(81372)
       expect(two.diagnostics.confirmedBreakCount).toBe(2)
       expect(two.providerTimeline.alignments.at(-1)).toEqual({
@@ -179,7 +187,7 @@ describe('Prime dynamic media duration alignments', () => {
   })
   test('J: initial insertion, skipped/multiple breaks and overlapping candidates are not apportioned', () => {
     expect(tracker().sample(1506.372, 1200).providerTimeline).toBeUndefined()
-    for (const position of [10, 1148.940833, 1400]) {
+    for (const position of [1148.940833, 1400]) {
       const session = tracker()
       session.sample(1425, 0)
       expect(
@@ -200,7 +208,11 @@ describe('Prime dynamic media duration alignments', () => {
     expect(mapped(first, 492158)).toBe(524190)
     session.sample(1457.032, 1148.94, 'timeupdate')
     const second = session.sample(1502, 1148.94)
-    expect(second.diagnostics.confirmedBreakCount).toBe(2)
+    expect(second.diagnostics.confirmedBreakCount).toBe(1)
+    expect(
+      session.sample(1502, 1149.606, 'timeupdate').diagnostics
+        .confirmedBreakCount
+    ).toBe(2)
     const amended = session.sample(1506.081, 1200.543033)
     expect(amended.diagnostics.status).toBe('tracking')
     expect(amended.diagnostics.confirmedBreakCount).toBe(2)
@@ -299,5 +311,108 @@ describe('Prime dynamic media duration alignments', () => {
     expect(result.diagnostics.previousMediaCurrentTimeMs).toBe(0)
     expect(result.diagnostics.candidateBreakIndices).toEqual([0])
     expect(result.diagnostics.sourceBreakTimesMs).toEqual([492158, 1117574])
+  })
+  test('measured 44.695s preallocation stays identity until the actual first mapped boundary', () => {
+    const session = tracker(evidence([407365, 963963]))
+    session.sample(1425, 12.89844, 'initial')
+    session.sample(1425, 362.662287, 'timeupdate')
+    const pending = session.sample(1473.798, 362.669901)
+    expect(pending.diagnostics).toMatchObject({
+      status: 'tracking',
+      reason: 'preloaded-next-break',
+      confirmedBreakCount: 0,
+      pendingBreakIndex: 0,
+      cumulativeInsertionMs: 48798,
+      pendingCumulativeInsertionMs: 48798,
+      confirmedCumulativeInsertionMs: 0,
+    })
+    expect(pending.providerTimeline.alignments).toHaveLength(1)
+    expect(mapped(pending, 300000)).toBe(300000)
+    expect(mapped(pending, 407365)).toBe(407365)
+    expect(
+      session.sample(1473.798, 407.364999, 'timeupdate').diagnostics
+        .confirmedBreakCount
+    ).toBe(0)
+    const confirmed = session.sample(1473.798, 407.365, 'timeupdate')
+    expect(confirmed.diagnostics.confirmedBreakCount).toBe(1)
+    expect(confirmed.diagnostics.confirmedCumulativeInsertionMs).toBe(48798)
+    expect(confirmed.diagnostics.pendingCumulativeInsertionMs).toBeNull()
+    expect(mapped(confirmed, 407364)).toBe(407364)
+    expect(mapped(confirmed, 407365)).toBe(456163)
+  })
+  test('chunked preloads for both breaks update pending cumulative without early activation', () => {
+    const session = tracker(evidence([407365, 963963]))
+    session.sample(1425, 12.89844)
+    for (const [cumulative, position] of [
+      [30000, 350],
+      [42000, 356],
+      [48798, 362.669901],
+    ]) {
+      const pending = session.sample((1425000 + cumulative) / 1000, position)
+      expect(pending.diagnostics.confirmedBreakCount).toBe(0)
+      expect(pending.diagnostics.pendingCumulativeInsertionMs).toBe(cumulative)
+      expect(mapped(pending, 407365)).toBe(407365)
+    }
+    const first = session.sample(1473.798, 407.365, 'timeupdate')
+    expect(mapped(first, 407365)).toBe(456163)
+    session.sample(1473.798, 800, 'timeupdate')
+    // Second preload timings/amounts are synthetic variable-ad examples.
+    for (const [cumulative, position] of [
+      [70000, 900],
+      [81081, 970],
+    ]) {
+      const pending = session.sample((1425000 + cumulative) / 1000, position)
+      expect(pending.diagnostics.confirmedBreakCount).toBe(1)
+      expect(pending.diagnostics.pendingBreakIndex).toBe(1)
+      expect(pending.diagnostics.confirmedCumulativeInsertionMs).toBe(48798)
+      expect(mapped(pending, 963963)).toBe(1012761)
+      expect(mapped(pending, 407365)).toBe(456163)
+    }
+    expect(
+      session.sample(1506.081, 1012.760999, 'pause').diagnostics
+        .confirmedBreakCount
+    ).toBe(1)
+    const second = session.sample(1506.081, 1012.761, 'timeupdate')
+    expect(second.diagnostics.confirmedBreakCount).toBe(2)
+    expect(mapped(second, 963963)).toBe(1045044)
+    expect(mapped(second, 963962)).toBe(1012760)
+  })
+  test('preload inside the 5-second tolerance still waits for actual break start', () => {
+    const session = tracker(evidence([407365, 963963]))
+    session.sample(1425, 400)
+    const pending = session.sample(1473.798, 405)
+    expect(pending.diagnostics.confirmedBreakCount).toBe(0)
+    expect(
+      session.sample(1473.798, 407.364, 'timeupdate').diagnostics
+        .confirmedBreakCount
+    ).toBe(0)
+    expect(
+      session.sample(1473.798, 407.365, 'timeupdate').diagnostics
+        .confirmedBreakCount
+    ).toBe(1)
+  })
+  test('preload safety rejects overlapping windows, missed break, seek, decrease and unowned backward reset', () => {
+    const close = tracker(evidence([407365, 430000]))
+    close.sample(1425, 12)
+    expect(close.sample(1473.798, 362.669901).providerTimeline).toBeUndefined()
+    for (const [duration, position, event] of [
+      [1473.798, 600, 'timeupdate'],
+      [1473.798, 1100, 'timeupdate'],
+      [1473.798, 407.365, 'seeking'],
+      [1467, 363, 'durationchange'],
+      [2025, 363, 'durationchange'],
+      [NaN, 363, 'durationchange'],
+      [1473.798, NaN, 'timeupdate'],
+    ]) {
+      const session = tracker(evidence([407365, 963963]))
+      session.sample(1425, 12.89844)
+      session.sample(1473.798, 362.669901)
+      expect(
+        session.sample(duration, position, event).providerTimeline
+      ).toBeUndefined()
+    }
+    const reset = tracker(evidence([407365, 963963]))
+    reset.sample(1425, 12.89844)
+    expect(reset.sample(1473.798, 0.907524).providerTimeline).toBeUndefined()
   })
 })

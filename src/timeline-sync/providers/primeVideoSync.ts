@@ -65,6 +65,7 @@ export interface PrimeSyncSample {
     readonly previousMediaCurrentTimeMs: number | null
     readonly event: PrimeTimelineEvent
     readonly pendingBreakIndex: number | null
+    readonly pendingCumulativeInsertionMs: number | null
     readonly candidateBreakIndices: readonly number[]
     readonly sourceBreakTimesMs: readonly number[]
     readonly alignments: readonly TimelineAlignment[]
@@ -94,6 +95,7 @@ export class PrimeDurationTracker {
   #previousTime: number | undefined
   #activeBreak: number | undefined
   #pendingBreak: number | undefined
+  #preloaded = false
   #seeking = false
   #failure: string | undefined
 
@@ -149,9 +151,35 @@ export class PrimeDurationTracker {
           index === confirmed ||
           (index === confirmed - 1 && index === this.#activeBreak)
         if (
+          this.#pendingBreak === undefined &&
+          confirmed < this.#breaks.sourceTimesMs.length &&
+          previousTime !== undefined &&
+          currentTime >= previousTime &&
+          currentTime < this.#start(confirmed) &&
+          (candidates.length === 0 ||
+            (candidates.length === 1 && owner === confirmed))
+        ) {
+          if (!this.#uniquePreload(confirmed, cumulative)) {
+            this.#failure = 'ambiguous-duration-growth'
+          } else {
+            // A normally advancing content clock can preload future ad duration.
+            // Keep the latest cumulative amount pending until this break is reached.
+            this.#pendingBreak = confirmed
+            this.#preloaded = true
+            this.#activeBreak = undefined
+          }
+        } else if (
+          this.#preloaded &&
+          !this.#uniquePreload(this.#pendingBreak!, cumulative)
+        ) {
+          this.#failure = 'ambiguous-duration-growth'
+        } else if (
           candidates.length === 1 &&
           eligible(owner) &&
-          (this.#pendingBreak === undefined || this.#pendingBreak === owner)
+          (this.#pendingBreak === undefined || this.#pendingBreak === owner) &&
+          // Preallocated duration is not applied before the actual mapped start,
+          // even if the event's position falls within the old 5-second tolerance.
+          (!this.#preloaded || currentTime >= this.#start(owner!))
         ) {
           const sourceTimeMs = this.#breaks.sourceTimesMs[owner!]!
           const alignment = {
@@ -163,8 +191,15 @@ export class PrimeDurationTracker {
           else this.#alignments[owner! + 1] = alignment
           this.#activeBreak = owner
           this.#pendingBreak = undefined
+          this.#preloaded = false
           this.#cumulative = cumulative
-        } else if (candidates.length === 0) {
+        } else if (
+          candidates.length === 0 ||
+          (candidates.length === 1 &&
+            owner === this.#pendingBreak &&
+            this.#preloaded &&
+            currentTime < this.#start(owner!))
+        ) {
           // A reset/stale event clock may precede the growth. Require a unique
           // immediately preceding ownership sample; break count alone is not proof.
           const hint =
@@ -177,7 +212,9 @@ export class PrimeDurationTracker {
           if (
             hint.length === 1 &&
             eligible(index) &&
-            currentTime < this.#start(index!) - POSITION_TOLERANCE_MS
+            currentTime <
+              this.#start(index!) -
+                (this.#preloaded ? 0 : POSITION_TOLERANCE_MS)
           ) {
             this.#pendingBreak = index
           } else this.#failure = 'ambiguous-duration-growth'
@@ -217,7 +254,9 @@ export class PrimeDurationTracker {
           this.#failure ??
           (this.#pendingBreak === undefined
             ? 'duration-boundaries'
-            : 'awaiting-break-position'),
+            : this.#preloaded
+              ? 'preloaded-next-break'
+              : 'awaiting-break-position'),
         breakCount: this.#breaks.sourceTimesMs.length,
         confirmedBreakCount: alignments.length ? alignments.length - 1 : 0,
         fullTitleDurationMs: this.#breaks.fullTitleDurationMs,
@@ -230,6 +269,10 @@ export class PrimeDurationTracker {
         previousMediaCurrentTimeMs: previousTime ?? null,
         event,
         pendingBreakIndex: this.#failure ? null : (this.#pendingBreak ?? null),
+        pendingCumulativeInsertionMs:
+          !this.#failure && this.#pendingBreak !== undefined
+            ? cumulative
+            : null,
         candidateBreakIndices: candidates,
         sourceBreakTimesMs: [...this.#breaks.sourceTimesMs],
         alignments,
@@ -245,6 +288,16 @@ export class PrimeDurationTracker {
           this.#alignments[index]!.sourceTimeMs
         : this.#cumulative!
     return this.#breaks.sourceTimesMs[index]! + prior
+  }
+
+  #uniquePreload(index: number, cumulative: number) {
+    const following = this.#breaks.sourceTimesMs[index + 1]
+    // Reject insertion whose proposed ownership window overlaps another break.
+    return (
+      following === undefined ||
+      this.#breaks.sourceTimesMs[index]! + cumulative + POSITION_TOLERANCE_MS <
+        following + this.#cumulative! - POSITION_TOLERANCE_MS
+    )
   }
 
   #candidates(currentTime: number, cumulative: number) {

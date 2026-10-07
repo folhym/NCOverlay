@@ -5,7 +5,8 @@ import { describe, expect, test } from 'bun:test'
 const probe = String.raw`
 import assert from 'node:assert/strict'
 import { mock } from 'bun:test'
-const mode = process.argv[1]
+const mode = process.argv.at(-1)
+const preallocation = mode.startsWith('preload-')
 const stored = new Map(), listeners = new Map(), logs = [], errors = []
 let observer, patcher, init, capture, clock = 0, searches = 0
 const captured = new Promise(resolve => { capture = resolve })
@@ -99,7 +100,7 @@ mock.module('@/ncoverlay/patcher', () => ({ NCOPatcher: class extends RealPatche
 const { extractPrimeTimelineEvidence } = await import('./src/timeline-sync/providers/primeVideo.ts')
 function packet(number = episode) {
   const fullTitleDurationMs = number === 1 ? 1425000 : 1426000
-  const points = number === 1 ? [492158, 1117574] : [433975, 846095]
+  const points = number === 1 ? (preallocation ? [407365, 963963] : [492158, 1117574]) : [433975, 846095]
   const ends = [...points, fullTitleDurationMs]
   const playbackUrls = { fullTitleDurationMs, intraTitlePlaylist: ends.flatMap((end, index) => [
     ...(index ? [{ type: 'Remote' }] : []),
@@ -138,6 +139,10 @@ class Video extends EventTarget {
   closest() { return { querySelector() { return { insertAdjacentElement() {} } } } }
 }
 let selectedVideo = new Video()
+if (preallocation) {
+  selectedVideo.currentTime = 12.89844
+  if (mode === 'preload-initial') selectedVideo.duration = 1473.798
+}
 globalThis.HTMLMediaElement = { HAVE_METADATA: 1 }
 globalThis.location = { pathname: '/synthetic-prime' }
 globalThis.performance = { now() { clock += 2000; return clock } }
@@ -163,7 +168,7 @@ async function seed() {
   const old = await info()
   await state().set('info', { ...old, chapters: [{ start: 10, end: 20 }], isNhkOndemand: true })
   await state().set('slots', [{ id: 'manual', isAutoLoaded: false, threads: [{
-    id: 'thread', fork: 'main', commentCount: 2, comments: [492158, 1117574].map((vposMs, index) => ({
+    id: 'thread', fork: 'main', commentCount: preallocation ? 3 : 2, comments: (preallocation ? [300000, 407365, 963963] : [492158, 1117574]).map((vposMs, index) => ({
       id: String(index), body: 'ordinary-' + index, vposMs, commands: [],
       userId: 'fixture', score: 0, isPremium: false,
     })),
@@ -180,7 +185,13 @@ async function native(event, position, video = selectedVideo) {
   video.dispatchEvent(new Event(event)); await flush()
 }
 function positions() { return patcher.nco.renderer.threads[0].comments.map(comment => comment.vposMs) }
-async function first() { await change(1457.782, mode === 'after' ? 526.13374 : 490.876409) }
+async function first() {
+  await change(1457.782, mode === 'after' ? 526.13374 : 490.876409)
+  if (mode !== 'after' && (await info()).providerTimeline) {
+    assert.equal((await info()).providerTimeline.alignments.length, 1, 'Growth just before the boundary is pending')
+    await native('timeupdate', 492.158)
+  }
+}
 await load()
 if (mode === 'initial-unknown') {
   const accepted = await info(), durationListener = [...selectedVideo.durationListeners][0]
@@ -190,7 +201,107 @@ if (mode === 'initial-unknown') {
   assert.equal(selectedVideo.durationListeners.size, 1)
   assert.equal([...selectedVideo.durationListeners][0], durationListener)
 }
-if (['observed-growth', 'chunked-growth', 'delayed-clock', 'early-growth',
+if (preallocation) {
+  const sync = () => logs.filter(([event]) => event === 'primeVideo.timelineSync').at(-1)[1]
+  if (mode === 'preload-initial') {
+    assert.equal((await info()).providerTimeline, undefined)
+    assert.equal(sync().reason, 'initial-insertion-unknown')
+  } else {
+    assert.equal(sync().confirmedBreakCount, 0)
+    assert.equal(sync().cumulativeInsertionMs, 0)
+    await seed()
+    const original = await info(), searchCount = searches, raw = JSON.stringify(await state().get('slots'))
+    const assertPending = async amount => {
+      assert.equal(sync().status, 'tracking')
+      assert.equal(sync().reason, 'preloaded-next-break')
+      assert.equal(sync().pendingBreakIndex, 0)
+      assert.equal(sync().confirmedBreakCount, 0)
+      assert.equal(sync().cumulativeInsertionMs, amount)
+      assert.equal(sync().pendingCumulativeInsertionMs, amount)
+      assert.equal(sync().confirmedCumulativeInsertionMs, 0)
+      assert.equal((await info()).providerTimeline.alignments.length, 1)
+      assert.deepEqual(positions(), [305000, 412365, 968963], 'Preload does not shift any comment')
+    }
+    if (mode === 'preload-chunks') {
+      await change(1455, 350); await assertPending(30000)
+      await change(1467, 356); await assertPending(42000)
+    }
+    await native('timeupdate', 362.662287)
+    await change(1473.798, 362.669901)
+    await assertPending(48798)
+    if (mode === 'preload-seek' || mode === 'preload-decrease' || mode === 'preload-missed' || mode === 'preload-skipped') {
+      if (mode === 'preload-seek') await native('seeking', 407.365)
+      else if (mode === 'preload-decrease') await change(1467, 363)
+      else await native('timeupdate', mode === 'preload-missed' ? 600 : 1100)
+      assert.equal(sync().status, 'disabled')
+      assert.equal((await info()).providerTimeline, undefined)
+      assert.deepEqual(positions(), [305000, 412365, 968963])
+    } else if (mode === 'preload-switch' || mode === 'preload-video' || mode === 'preload-id') {
+      const old = selectedVideo
+      if (mode === 'preload-video') {
+        selectedVideo = new Video(); await patcher.setVideo(selectedVideo); await load()
+      } else {
+        episode = 2; selectedVideo.duration = 1426; selectedVideo.currentTime = 0
+        if (mode === 'preload-switch') await observer.callback()
+        else { titleDom = 'missing'; subtitleDom = 'empty'; await observer.callback() }
+        await load('reload')
+      }
+      assert.equal(sync().pendingBreakIndex, null)
+      assert.equal(sync().pendingCumulativeInsertionMs, null)
+      assert.equal(sync().confirmedBreakCount, 0)
+      assert.equal(sync().confirmedCumulativeInsertionMs, 0)
+      assert.equal((await info()).providerTimeline.alignments.length, 1)
+      if (mode === 'preload-video') {
+        const accepted = await info()
+        await native('timeupdate', 407.365, old)
+        assert.deepEqual(await info(), accepted)
+      }
+    } else {
+      if (mode === 'preload-transient') {
+        const accepted = await info(), callbacks = [...selectedVideo.durationListeners]
+        titleDom = 'missing'; subtitleDom = 'empty'; await observer.callback(); await flush()
+        titleDom = 'present'; subtitleDom = 'present'; await observer.callback(); await flush()
+        assert.deepEqual(await info(), accepted)
+        assert.deepEqual([...selectedVideo.durationListeners], callbacks)
+      }
+      await native('timeupdate', 407.364999)
+      assert.equal(sync().confirmedBreakCount, 0)
+      assert.deepEqual(positions(), [305000, 412365, 968963])
+      await native('timeupdate', 407.365)
+      assert.equal(sync().confirmedBreakCount, 1)
+      assert.equal(sync().confirmedCumulativeInsertionMs, 48798)
+      assert.equal((await info()).providerTimeline.alignments[1].targetTimeMs, 456163)
+      assert.deepEqual(positions(), [305000, 461163, 1017761])
+      // Second-break preload amounts and positions are synthetic; only first
+      // preload has the newly reported event clock and measured cumulative.
+      await native('timeupdate', 800)
+      await change(1495, 900)
+      await change(1506.081, 970)
+      assert.equal(sync().pendingBreakIndex, 1)
+      assert.equal(sync().confirmedBreakCount, 1)
+      assert.equal(sync().confirmedCumulativeInsertionMs, 48798)
+      assert.equal(sync().pendingCumulativeInsertionMs, 81081)
+      assert.deepEqual(positions(), [305000, 461163, 1017761])
+      await native('timeupdate', 1012.760999)
+      assert.equal(sync().confirmedBreakCount, 1)
+      await native('timeupdate', 1012.761)
+      assert.equal(sync().confirmedBreakCount, 2)
+      assert.equal((await info()).providerTimeline.alignments[2].targetTimeMs, 1045044)
+      assert.deepEqual(positions(), [305000, 461163, 1050044])
+      assert.equal(positions()[0] + patcher.nco.renderer.offset * 1000, 307000)
+      assert.equal(positions()[2] + patcher.nco.renderer.offset * 1000, 1052044)
+    }
+    if (!['preload-switch', 'preload-video', 'preload-id'].includes(mode)) {
+      const { providerTimeline: _a, ...preserved } = await info()
+      const { providerTimeline: _b, ...expected } = original
+      assert.deepEqual(preserved, expected)
+      assert.equal(searches, searchCount)
+      assert.equal(JSON.stringify(await state().get('slots')), raw)
+      assert.equal(await state().get('offset'), 2)
+      assert.equal((await state().get('slotDetails'))[0].offsetMs, 5000)
+    }
+  }
+} else if (['observed-growth', 'chunked-growth', 'delayed-clock', 'early-growth',
   'sealed-break', 'seek-recapture', 'observed-switch', 'separate-video',
   'delayed-without-prior', 'pending-seek', 'seek-in-progress'].includes(mode)) {
   assert.equal((await info()).providerTimeline.alignments.length, 1)
@@ -212,8 +323,13 @@ if (['observed-growth', 'chunked-growth', 'delayed-clock', 'early-growth',
   if (mode === 'early-growth') {
     await native('timeupdate', 10)
     await change(1457.032, 10)
-    await assertDisabled()
+    assert.equal(syncLogs().at(-1)[1].status, 'tracking')
+    assert.equal(syncLogs().at(-1)[1].confirmedBreakCount, 0)
+    assert.deepEqual(positions(), [497158, 1122574])
+    await native('timeupdate', 492.158)
+    await assertFirst()
   } else if (mode === 'delayed-without-prior') {
+    await native('timeupdate', 100)
     await change(1457.032, 0.907524)
     await assertDisabled()
     await native('pause', 504.910584)
@@ -358,6 +474,7 @@ if (['observed-growth', 'chunked-growth', 'delayed-clock', 'early-growth',
     assert.equal(searches, searchCount, 'Unknown DOM must not restart search')
     if (mode === 'transient-duration') {
       await change(1506.372, 1148.940833)
+      await native('timeupdate', 1150.356)
       sameListener()
       assert.equal((await info()).providerTimeline.alignments[2].targetTimeMs, 1198946)
     } else if (mode === 'transient-reload') {
@@ -372,7 +489,10 @@ if (['observed-growth', 'chunked-growth', 'delayed-clock', 'early-growth',
     sameListener()
     assert.deepEqual(await info(), beforeRestore, 'Restoring the same valid DOM must preserve state')
     assert.equal(searches, searchCount + (mode === 'transient-reload' ? 1 : 0))
-    if (mode !== 'transient-duration') await change(1506.372, 1148.940833)
+    if (mode !== 'transient-duration') {
+      await change(1506.372, 1148.940833)
+      await native('timeupdate', 1150.356)
+    }
     sameListener()
     assert.equal((await info()).providerTimeline.alignments[1].targetTimeMs, 524940)
     assert.equal((await info()).providerTimeline.alignments[2].targetTimeMs, 1198946)
@@ -390,6 +510,7 @@ if (['observed-growth', 'chunked-growth', 'delayed-clock', 'early-growth',
     }
     const refreshed = patcher.nco.renderer.refreshes
     await change(1506.372, mode === 'after' ? 1200.543033 : 1148.940833)
+    if (mode !== 'after') await native('timeupdate', 1150.356)
     assert.deepEqual(positions(), [529940, 1203946])
     assert.ok(patcher.nco.renderer.refreshes > refreshed)
     assert.equal((await info()).providerTimeline.alignments[2].targetTimeMs, 1198946)
@@ -496,6 +617,7 @@ if (['observed-growth', 'chunked-growth', 'delayed-clock', 'early-growth',
   } else if (mode === 'precommit-duration') {
     const playing = await init.getInfo(patcher.nco, {})
     await change(1506.372, 1148.940833)
+    await native('timeupdate', 1150.356)
     await state().set('info', { ...(await info()), providerTimeline: playing.providerTimeline })
     await flush()
     assert.equal((await info()).providerTimeline.alignments[2].targetTimeMs, 1198946)
@@ -568,10 +690,23 @@ describe('Prime durationchange through actual runtime and renderer refresh', () 
     'delayed-without-prior',
     'pending-seek',
     'seek-in-progress',
+    'preload-measured',
+    'preload-chunks',
+    'preload-seek',
+    'preload-decrease',
+    'preload-missed',
+    'preload-skipped',
+    'preload-switch',
+    'preload-video',
+    'preload-id',
+    'preload-transient',
+    'preload-initial',
   ]) {
     test(mode, () => {
       const result = Bun.spawnSync({
-        cmd: [process.execPath, '--eval', probe, mode],
+        // Keep large fixtures off Windows' command-line length limit.
+        cmd: [process.execPath, 'run', '-', mode],
+        stdin: new TextEncoder().encode(probe),
         cwd: process.cwd(),
         stdout: 'pipe',
         stderr: 'pipe',
