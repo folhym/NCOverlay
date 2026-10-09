@@ -38,12 +38,22 @@ export interface NCOPatcherInit {
 }
 
 export interface NCOPatcherInfoRequest {
+  /** Owner/metadata generation; providers may stop bounded retries on cancellation. */
+  isOwnerCurrent?: () => boolean
+  /** Provider already emitted a sanitized classification; omit exception payload. */
+  failureLogged?: boolean
+  /** Provider may authorize a fresh read if its lease expired before info commit. */
+  retryOnStale?: () => boolean
   /** Optional provider check immediately before committing even a null result. */
   isCurrent?: () => boolean
 }
 
 export interface NCOPatcherFunctions {
   getCurrentTime?: () => number
+  /** Opt-in numeric canvas lifecycle diagnostics; no frame-by-frame logging. */
+  canvasDiagnostics?: boolean
+  /** Opt-in sanitized metadata/search/load stages. */
+  pipelineDiagnostics?: boolean
 }
 
 export class NCOPatcher {
@@ -54,6 +64,7 @@ export class NCOPatcher {
   #tabId: number | null = null
   #video: HTMLVideoElement | null = null
   #nco: NCOverlay | null = null
+  #videoGeneration = 0
 
   get nco() {
     return this.#nco
@@ -72,6 +83,7 @@ export class NCOPatcher {
   }
 
   async dispose() {
+    this.#videoGeneration++
     logger.log('NCOPatcher.dispose()')
 
     await this.#nco?.dispose()
@@ -85,6 +97,7 @@ export class NCOPatcher {
     fileDetail: StateFileDetail | null = null
   ) {
     if (this.#video === video) return
+    const ownerGeneration = ++this.#videoGeneration
 
     logger.log('NCOPatcher.setVideo()')
 
@@ -96,24 +109,81 @@ export class NCOPatcher {
       this.#tabId = tab?.id!
     }
 
+    if (ownerGeneration !== this.#videoGeneration) return
     await this.#nco?.dispose()
+    if (ownerGeneration !== this.#videoGeneration) return
 
-    this.#nco = new NCOverlay(this.#tabId, this.#video, this.#functions)
+    this.#nco = new NCOverlay(this.#tabId, video, this.#functions)
+    const nco = this.#nco
+    let infoGeneration = 0
+    let pendingWrite: Promise<unknown> = Promise.resolve()
+    const isCurrent = (generation: number) =>
+      ownerGeneration === this.#videoGeneration &&
+      this.#nco === nco &&
+      generation === infoGeneration
+    // Drain dispatched state writes/cleanup before the next metadata commit.
+    const write = (generation: number, task: () => Promise<unknown>) => {
+      const result = pendingWrite.then(() =>
+        isCurrent(generation) ? task() : undefined
+      )
+      pendingWrite = result.catch(() => {})
+      return result
+    }
+    const trace = (
+      event: string,
+      generation: number,
+      failurePhase: 'provider' | 'parse' | 'commit' | null = null
+    ) => {
+      if (this.#functions?.pipelineDiagnostics) {
+        logger.log('nco.commentPipeline', {
+          event,
+          ownerGeneration,
+          generation,
+          current: isCurrent(generation),
+          failurePhase,
+        })
+      }
+    }
 
     this.#nco.state.set('vod', this.#vod)
     this.#nco.state.set('fileDetail', fileDetail)
 
-    const loadInfo = async () => {
-      if (!this.#nco) return
+    const loadInfo = async (
+      generation: number,
+      request: NCOPatcherInfoRequest = {
+        isOwnerCurrent: () => isCurrent(generation),
+      },
+      commitAttempt = 0
+    ): Promise<boolean> => {
+      if (!isCurrent(generation)) return false
+      trace('getInfo.start', generation)
 
       logger.log('NCOPatcher.setVideo > loadInfo()')
 
+      const retry = () => {
+        if (
+          isCurrent(generation) &&
+          commitAttempt < 2 &&
+          request.retryOnStale?.()
+        ) {
+          trace('getInfo.retry', generation)
+          return loadInfo(generation, request, commitAttempt + 1)
+        }
+        return false
+      }
+      let failurePhase: 'provider' | 'parse' | 'commit' = 'provider'
       try {
-        const request: NCOPatcherInfoRequest = {}
-        const info = await this.#init.getInfo(this.#nco, request)
+        const info = await this.#init.getInfo(nco, request)
 
-        if (request.isCurrent && !request.isCurrent()) return
+        if (
+          !isCurrent(generation) ||
+          (request.isCurrent && !request.isCurrent())
+        ) {
+          trace('getInfo.stale', generation)
+          return retry()
+        }
 
+        failurePhase = 'parse'
         let parsed: ParsedResult | undefined
 
         if (info) {
@@ -143,29 +213,57 @@ export class NCOPatcher {
           isNhkOndemand: info?.isNhkOndemand,
         }
 
-        await this.#nco.state.set('info', args)
+        failurePhase = 'commit'
+        let accepted = false
+        await write(generation, () => {
+          if (request.isCurrent && !request.isCurrent())
+            return Promise.resolve()
+          accepted = true
+          return nco.state.set('info', args)
+        })
+        if (
+          !accepted ||
+          !isCurrent(generation) ||
+          (request.isCurrent && !request.isCurrent())
+        ) {
+          trace('getInfo.stale', generation)
+          if (accepted && isCurrent(generation)) {
+            // A context can change while the already dispatched storage write
+            // completes. Do not search from that stale info while recovering.
+            await write(generation, () => nco.state.remove('info'))
+          }
+          return retry()
+        }
+        trace('getInfo.accepted', generation)
 
         logger.log('state.info', args)
+        return true
       } catch (err) {
-        logger.error('NCOPatcher.setVideo > loadInfo()', err)
+        trace('getInfo.error', generation, failurePhase)
+        if (!request.failureLogged && !this.#functions?.pipelineDiagnostics)
+          logger.error('NCOPatcher.setVideo > loadInfo()', err)
+        return false
       }
     }
 
-    const autoSearch = async () => {
-      if (!this.#nco) return
+    const autoSearch = async (generation: number) => {
+      if (!isCurrent(generation)) return
 
       logger.log('NCOPatcher.setVideo > autoSearch()')
 
-      const status = await this.#nco.state.get('status')
+      const status = await nco.state.get('status')
+      if (!isCurrent(generation)) return
 
       if (status === 'searching' || status === 'loading') {
+        trace('search.busy', generation)
         return
       }
 
-      await this.#nco.state.set('status', 'searching')
+      await write(generation, () => nco.state.set('status', 'searching'))
+      trace('search.start', generation)
 
       try {
-        const info = await this.#nco.state.get('info')
+        const info = await nco.state.get('info')
 
         const [targets, jikkyoChannelIds, jikkyoIgnoreRerun] =
           await settings.get(
@@ -173,6 +271,7 @@ export class NCOPatcher {
             'autoSearch:jikkyoChannelIds',
             'autoSearch:jikkyoIgnoreRerun'
           )
+        if (!isCurrent(generation)) return
 
         const args: (NCOSearcherAutoSearchArgs & StateInfo) | null = {
           input: '',
@@ -189,21 +288,23 @@ export class NCOPatcher {
         // 自動検索
         if (args.targets.length && args.input && args.duration) {
           if (this.#init.autoSearch) {
-            await this.#init.autoSearch(this.#nco, args)
+            await this.#init.autoSearch(nco, args)
           } else {
-            await this.#nco.searcher.autoSearch(args)
+            await nco.searcher.autoSearch(args)
           }
         }
       } catch (err) {
+        trace('search.error', generation)
         logger.error('NCOPatcher.setVideo > autoSearch()', err)
       }
 
-      await this.#nco.state.set('status', 'ready')
+      await write(generation, () => nco.state.set('status', 'ready'))
+      trace('search.complete', generation)
     }
 
     let prev: number | null = null
 
-    this.#nco.addEventListener('loadedmetadata', async function () {
+    nco.addEventListener('loadedmetadata', async function () {
       const now = performance.now()
       const isSkip = prev !== null && now - prev < 1000
 
@@ -211,22 +312,29 @@ export class NCOPatcher {
 
       if (isSkip) return
 
-      await this.clear()
+      const generation = ++infoGeneration
+      trace('loadedmetadata', generation)
+      await write(generation, () => nco.clear())
 
-      await loadInfo()
+      if (!(await loadInfo(generation))) return
 
       if (await settings.get('autoSearch:manual')) return
 
-      await autoSearch()
+      await autoSearch(generation)
     })
 
-    this.#nco.addEventListener('reload', async function () {
-      await this.state.remove('status')
-      await this.state.remove('slots', { isAutoLoaded: true })
-      await this.state.remove('slotDetails', { isAutoLoaded: true })
+    nco.addEventListener('reload', async function () {
+      const generation = ++infoGeneration
+      trace('reload', generation)
+      await write(generation, async () => {
+        await nco.searcher.cancel()
+        await this.state.remove('status')
+        await this.state.remove('slots', { isAutoLoaded: true })
+        await this.state.remove('slotDetails', { isAutoLoaded: true })
+      })
 
-      await loadInfo()
-      await autoSearch()
+      if (!(await loadInfo(generation))) return
+      await autoSearch(generation)
     })
 
     const intervalMs = 250

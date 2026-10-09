@@ -1,4 +1,6 @@
 // @ts-check
+import { fileURLToPath } from 'node:url'
+
 import { heroui } from '@heroui/react'
 
 import { brandColors, themeColorsDark, themeColorsLight } from './theme-colors'
@@ -20,7 +22,13 @@ const size = {
  */
 export default {
   content: [
-    './node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}',
+    // Root the dependency scan explicitly; nested globs miss it on Windows.
+    {
+      base: fileURLToPath(
+        new URL('./node_modules/@heroui/theme/dist', import.meta.url)
+      ),
+      pattern: '**/*',
+    },
     './src/**/*.{js,ts,jsx,tsx}',
   ],
   darkMode: 'class',

@@ -25,6 +25,7 @@ export class PrimeVideoTimelineSession {
   readonly #getContext: () => string | null
   #context: string | null
   #version = 0
+  #metadataGeneration = 0
   #active = false
   #disposed = false
   #source: string | undefined
@@ -41,6 +42,18 @@ export class PrimeVideoTimelineSession {
     return this.#version
   }
 
+  get metadataGeneration() {
+    return this.#metadataGeneration
+  }
+
+  isMetadataOwner(generation: number) {
+    return (
+      !this.#disposed &&
+      this.#isOwner() &&
+      generation === this.#metadataGeneration
+    )
+  }
+
   constructor(
     nco: NCOverlay,
     isOwner: () => boolean,
@@ -54,11 +67,13 @@ export class PrimeVideoTimelineSession {
     const clear = nco.clear.bind(nco)
     const dispose = nco.dispose.bind(nco)
     nco.clear = async (...args) => {
+      this.#metadataGeneration++
       // Keep private evidence only for a subsequently reverified same source.
       await this.pause(false, false)
       return clear(...args)
     }
     nco.dispose = async (...args) => {
+      this.#metadataGeneration++
       this.#disposed = true
       await this.pause(true, false)
       return dispose(...args)

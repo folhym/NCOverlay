@@ -1,6 +1,7 @@
 import type { MarkerKey } from '@/constants/markers'
 import type { Browser } from '@/utils/webext'
 import type { NCOPatcherFunctions } from './patcher'
+import type { NcoThreadsV1Thread } from './state'
 
 import equal from 'fast-deep-equal'
 
@@ -42,6 +43,10 @@ export class NCOverlay {
   readonly #port: Browser.runtime.Port
 
   #threadRevision = 0
+  #clearing = 0
+  #disposed = false
+  #renderedThreads: NcoThreadsV1Thread[] | null = null
+  #pipelineDiagnostics = false
 
   get video() {
     return this.renderer.video
@@ -56,10 +61,11 @@ export class NCOverlay {
     functions?: NCOPatcherFunctions
   ) {
     logger.log('new NCOverlay()')
+    this.#pipelineDiagnostics = functions?.pipelineDiagnostics ?? false
 
     this.id = tabId
     this.state = new NCOState(this.id)
-    this.searcher = new NCOSearcher(this.state)
+    this.searcher = new NCOSearcher(this.state, functions?.pipelineDiagnostics)
     this.renderer = new NCORenderer(video, functions)
     this.keyboard = new NCOKeyboard(this.state, {
       jumpMarker: (...args) => this.jumpMarker(...args),
@@ -85,12 +91,16 @@ export class NCOverlay {
   }
 
   async dispose() {
+    if (this.#disposed) return
+    this.#disposed = true
     logger.log('NCOverlay.dispose()')
 
     this.#threadRevision++
+    this.renderer.dispose()
+    this.#renderedThreads = null
+    await this.searcher.cancel()
     await this.state.dispose()
     this.#threadRevision++
-    this.renderer.dispose()
     this.keyboard.dispose()
 
     this.#port.disconnect()
@@ -102,12 +112,20 @@ export class NCOverlay {
   }
 
   async clear() {
+    if (this.#disposed) return
     logger.log('NCOverlay.clear()')
 
     this.#threadRevision++
-    await this.state.clear()
-    this.#threadRevision++
+    this.#clearing++
     this.renderer.clear()
+    this.#renderedThreads = null
+    try {
+      await this.searcher.cancel()
+      await this.state.clear()
+    } finally {
+      this.#threadRevision++
+      this.#clearing--
+    }
 
     await sendExtensionMessage('bg:setBadge', { text: null })
   }
@@ -162,14 +180,40 @@ export class NCOverlay {
   /**
    * 描画するコメントデータを更新する
    */
-  #updateRendererThreads = async () => {
+  #updateRendererThreads = () => this.#refreshRendererThreads(false)
+
+  #refreshRendererThreads = async (timelineOnly: boolean) => {
+    if (this.#disposed || this.#clearing) {
+      this.#traceThreads('blocked')
+      return
+    }
     const revision = ++this.#threadRevision
     const threads = await this.state.getThreads()
 
-    if (revision !== this.#threadRevision) return
+    if (this.#disposed || this.#clearing || revision !== this.#threadRevision) {
+      this.#traceThreads('stale')
+      return
+    }
+    // Timeline duration/pending evidence may change without changing displayed
+    // comments. Do not create/destroy GPU surfaces for an identical result.
+    if (timelineOnly && equal(threads, this.#renderedThreads)) return
 
     this.renderer.setThreads(threads)
     this.renderer.reload()
+    this.#renderedThreads = threads
+    this.#traceThreads('accepted', threads?.length ?? 0)
+  }
+
+  #traceThreads(event: 'blocked' | 'stale' | 'accepted', count = 0) {
+    if (this.#pipelineDiagnostics) {
+      logger.log('nco.rendererThreads', {
+        event,
+        revision: this.#threadRevision,
+        clearing: this.#clearing,
+        disposed: this.#disposed,
+        count,
+      })
+    }
   }
 
   /**
@@ -269,7 +313,7 @@ export class NCOverlay {
       // Provider timeline changes also refresh manually added eligible slots.
       this.state.onChange('info', (newValue, oldValue) => {
         if (!equal(newValue?.providerTimeline, oldValue?.providerTimeline)) {
-          this.#updateRendererThreads()
+          this.#refreshRendererThreads(true)
         }
       }),
 

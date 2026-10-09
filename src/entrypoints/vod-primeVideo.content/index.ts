@@ -6,6 +6,7 @@ import { parse } from '@midra/nco-utils/parse'
 import { normalize } from '@midra/nco-utils/parse/libs/normalize'
 
 import { inspectPrimeTimeline } from '@/timeline-sync/providers/primeVideo'
+import { PrimeVideoMetadataReader } from '@/timeline-sync/providers/primeVideoMetadata'
 import { PrimeVideoTimelineSession } from '@/timeline-sync/providers/primeVideoSession'
 import { MATCHES } from '@/constants/matches'
 import { logger } from '@/utils/logger'
@@ -32,6 +33,7 @@ async function main() {
   logger.log('vod', vod)
 
   const sessions = new WeakMap<NCOverlay, PrimeVideoTimelineSession>()
+  const metadataReaders = new WeakMap<NCOverlay, PrimeVideoMetadataReader>()
   // Only complete Episode context can identify a change. Controls/ads may
   // temporarily remove either element. Values are private, never logged.
   const getContext = () => {
@@ -59,101 +61,113 @@ async function main() {
         getContext
       )
       sessions.set(nco, session)
+      metadataReaders.set(
+        nco,
+        new PrimeVideoMetadataReader(
+          getContext,
+          (signal) =>
+            sendPageMessage('page:primeVideo:getPlaybackInfo', null, signal),
+          sleep
+        )
+      )
     }
     return session
   }
 
-  const patcher = new NCOPatcher(vod, {
-    getInfo: async (nco, request) => {
-      const session = getSession(nco)
-      const drained = session.pause()
-      const version = session.version
-      request.isCurrent = () => session.isCurrent(version)
-      await drained
-      await sleep(2000)
+  const patcher = new NCOPatcher(
+    vod,
+    {
+      getInfo: async (nco, request) => {
+        const session = getSession(nco)
+        return metadataReaders
+          .get(nco)!
+          .load(session, request, (playbackInfo) => {
+            const inspection = inspectPrimeTimeline(
+              playbackInfo?.timelineEvidence,
+              nco.video.duration,
+              nco.video.currentTime
+            )
+            logger.log('primeVideo.timelineEvidence', inspection.diagnostics)
 
-      const playbackInfo = await sendPageMessage(
-        'page:primeVideo:getPlaybackInfo',
-        null
-      )
-      if (!request.isCurrent()) throw new Error('Stale Prime metadata response')
+            const { playbackUrls, catalog } = playbackInfo
 
-      const inspection = inspectPrimeTimeline(
-        playbackInfo?.timelineEvidence,
-        nco.video.duration,
-        nco.video.currentTime
-      )
-      logger.log('primeVideo.timelineEvidence', inspection.diagnostics)
+            const title = catalog.seriesTitle || catalog.title
+            const subtitle = catalog.seriesTitle ? catalog.title : null
 
-      if (!playbackInfo) {
-        return null
-      }
+            const seasonNum = catalog.seasonNumber ?? -1
+            const episodeNum = catalog.episodeNumber ?? -1
 
-      const { playbackUrls, catalog } = playbackInfo
+            const seasonNumVague = Number(
+              normalize(title).match(SEASON_NUM_VAGUE_REGEXP)?.[0] ?? -1
+            )
 
-      const title = catalog.seriesTitle || catalog.title
-      const subtitle = catalog.seriesTitle ? catalog.title : null
+            const parsedSubtitle = parse(`タイトル ${subtitle}`)
+            const titleSeason = parse(`${title} #0`).season
+            const subtitleEpisode =
+              subtitle && parsedSubtitle.isSingleEpisode
+                ? parsedSubtitle.episode
+                : null
 
-      const seasonNum = catalog.seasonNumber ?? -1
-      const episodeNum = catalog.episodeNumber ?? -1
+            const seasonText =
+              !titleSeason && 2 <= seasonNum && seasonNum !== seasonNumVague
+                ? `第${seasonNum}期`
+                : null
+            const workTitle =
+              [title, seasonText].filter(Boolean).join(' ').trim() || null
 
-      const seasonNumVague = Number(
-        normalize(title).match(SEASON_NUM_VAGUE_REGEXP)?.[0] ?? -1
-      )
+            const episodeText =
+              !subtitleEpisode && 0 <= episodeNum ? `第${episodeNum}話` : null
+            const episodeTitle =
+              [episodeText, subtitle].filter(Boolean).join(' ').trim() || null
 
-      const parsedSubtitle = parse(`タイトル ${subtitle}`)
-      const titleSeason = parse(`${title} #0`).season
-      const subtitleEpisode =
-        subtitle && parsedSubtitle.isSingleEpisode
-          ? parsedSubtitle.episode
-          : null
+            const duration = playbackUrls.fullTitleDurationMs / 1000
 
-      const seasonText =
-        !titleSeason && 2 <= seasonNum && seasonNum !== seasonNumVague
-          ? `第${seasonNum}期`
-          : null
-      const workTitle =
-        [title, seasonText].filter(Boolean).join(' ').trim() || null
+            logger.log('workTitle', workTitle)
+            logger.log('episodeTitle', episodeTitle)
+            logger.log('duration', duration)
 
-      const episodeText =
-        !subtitleEpisode && 0 <= episodeNum ? `第${episodeNum}話` : null
-      const episodeTitle =
-        [episodeText, subtitle].filter(Boolean).join(' ').trim() || null
+            const providerTimeline = session.resume(
+              playbackInfo.id,
+              playbackInfo.timelineEvidence,
+              // Playback observations cover Episodes; movies retain the normal pipeline.
+              catalog.type === 'EPISODE' &&
+                !!catalog.seriesTitle &&
+                Number.isSafeInteger(catalog.seasonNumber) &&
+                Number.isSafeInteger(catalog.episodeNumber) &&
+                seasonNum >= 0 &&
+                episodeNum >= 0
+            )
 
-      const duration = playbackUrls.fullTitleDurationMs / 1000
-
-      logger.log('workTitle', workTitle)
-      logger.log('episodeTitle', episodeTitle)
-      logger.log('duration', duration)
-
-      const providerTimeline = session.resume(
-        playbackInfo.id,
-        playbackInfo.timelineEvidence,
-        // Playback observations cover Episodes; movies retain the normal pipeline.
-        catalog.type === 'EPISODE' &&
-          !!catalog.seriesTitle &&
-          Number.isSafeInteger(catalog.seasonNumber) &&
-          Number.isSafeInteger(catalog.episodeNumber) &&
-          seasonNum >= 0 &&
-          episodeNum >= 0
-      )
-
-      return workTitle
-        ? {
-            input: `${workTitle} ${episodeTitle ?? ''}`,
-            duration,
-            providerTimeline,
-          }
-        : null
+            return workTitle
+              ? {
+                  input: `${workTitle} ${episodeTitle ?? ''}`,
+                  duration,
+                  providerTimeline,
+                }
+              : null
+          })
+          .catch((error) => {
+            logger.log(
+              'primeVideo.timelineEvidence',
+              inspectPrimeTimeline(
+                undefined,
+                nco.video.duration,
+                nco.video.currentTime
+              ).diagnostics
+            )
+            throw error
+          })
+      },
+      appendCanvas: (video, canvas) => {
+        if (patcher.nco) getSession(patcher.nco)
+        video
+          .closest('.dv-player-fullscreen')
+          ?.querySelector('.atvwebplayersdk-player-container')
+          ?.insertAdjacentElement('afterbegin', canvas)
+      },
     },
-    appendCanvas: (video, canvas) => {
-      if (patcher.nco) getSession(patcher.nco)
-      video
-        .closest('.dv-player-fullscreen')
-        ?.querySelector('.atvwebplayersdk-player-container')
-        ?.insertAdjacentElement('afterbegin', canvas)
-    },
-  })
+    { canvasDiagnostics: true, pipelineDiagnostics: true }
+  )
 
   const obs_config: MutationObserverInit = {
     childList: true,
