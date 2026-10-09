@@ -44,6 +44,8 @@ export interface NCOPatcherInfoRequest {
 
 export interface NCOPatcherFunctions {
   getCurrentTime?: () => number
+  /** Opt-in numeric canvas lifecycle diagnostics; no frame-by-frame logging. */
+  canvasDiagnostics?: boolean
 }
 
 export class NCOPatcher {

@@ -63,97 +63,102 @@ async function main() {
     return session
   }
 
-  const patcher = new NCOPatcher(vod, {
-    getInfo: async (nco, request) => {
-      const session = getSession(nco)
-      const drained = session.pause()
-      const version = session.version
-      request.isCurrent = () => session.isCurrent(version)
-      await drained
-      await sleep(2000)
+  const patcher = new NCOPatcher(
+    vod,
+    {
+      getInfo: async (nco, request) => {
+        const session = getSession(nco)
+        const drained = session.pause()
+        const version = session.version
+        request.isCurrent = () => session.isCurrent(version)
+        await drained
+        await sleep(2000)
 
-      const playbackInfo = await sendPageMessage(
-        'page:primeVideo:getPlaybackInfo',
-        null
-      )
-      if (!request.isCurrent()) throw new Error('Stale Prime metadata response')
+        const playbackInfo = await sendPageMessage(
+          'page:primeVideo:getPlaybackInfo',
+          null
+        )
+        if (!request.isCurrent())
+          throw new Error('Stale Prime metadata response')
 
-      const inspection = inspectPrimeTimeline(
-        playbackInfo?.timelineEvidence,
-        nco.video.duration,
-        nco.video.currentTime
-      )
-      logger.log('primeVideo.timelineEvidence', inspection.diagnostics)
+        const inspection = inspectPrimeTimeline(
+          playbackInfo?.timelineEvidence,
+          nco.video.duration,
+          nco.video.currentTime
+        )
+        logger.log('primeVideo.timelineEvidence', inspection.diagnostics)
 
-      if (!playbackInfo) {
-        return null
-      }
+        if (!playbackInfo) {
+          return null
+        }
 
-      const { playbackUrls, catalog } = playbackInfo
+        const { playbackUrls, catalog } = playbackInfo
 
-      const title = catalog.seriesTitle || catalog.title
-      const subtitle = catalog.seriesTitle ? catalog.title : null
+        const title = catalog.seriesTitle || catalog.title
+        const subtitle = catalog.seriesTitle ? catalog.title : null
 
-      const seasonNum = catalog.seasonNumber ?? -1
-      const episodeNum = catalog.episodeNumber ?? -1
+        const seasonNum = catalog.seasonNumber ?? -1
+        const episodeNum = catalog.episodeNumber ?? -1
 
-      const seasonNumVague = Number(
-        normalize(title).match(SEASON_NUM_VAGUE_REGEXP)?.[0] ?? -1
-      )
+        const seasonNumVague = Number(
+          normalize(title).match(SEASON_NUM_VAGUE_REGEXP)?.[0] ?? -1
+        )
 
-      const parsedSubtitle = parse(`タイトル ${subtitle}`)
-      const titleSeason = parse(`${title} #0`).season
-      const subtitleEpisode =
-        subtitle && parsedSubtitle.isSingleEpisode
-          ? parsedSubtitle.episode
+        const parsedSubtitle = parse(`タイトル ${subtitle}`)
+        const titleSeason = parse(`${title} #0`).season
+        const subtitleEpisode =
+          subtitle && parsedSubtitle.isSingleEpisode
+            ? parsedSubtitle.episode
+            : null
+
+        const seasonText =
+          !titleSeason && 2 <= seasonNum && seasonNum !== seasonNumVague
+            ? `第${seasonNum}期`
+            : null
+        const workTitle =
+          [title, seasonText].filter(Boolean).join(' ').trim() || null
+
+        const episodeText =
+          !subtitleEpisode && 0 <= episodeNum ? `第${episodeNum}話` : null
+        const episodeTitle =
+          [episodeText, subtitle].filter(Boolean).join(' ').trim() || null
+
+        const duration = playbackUrls.fullTitleDurationMs / 1000
+
+        logger.log('workTitle', workTitle)
+        logger.log('episodeTitle', episodeTitle)
+        logger.log('duration', duration)
+
+        const providerTimeline = session.resume(
+          playbackInfo.id,
+          playbackInfo.timelineEvidence,
+          // Playback observations cover Episodes; movies retain the normal pipeline.
+          catalog.type === 'EPISODE' &&
+            !!catalog.seriesTitle &&
+            Number.isSafeInteger(catalog.seasonNumber) &&
+            Number.isSafeInteger(catalog.episodeNumber) &&
+            seasonNum >= 0 &&
+            episodeNum >= 0
+        )
+
+        return workTitle
+          ? {
+              input: `${workTitle} ${episodeTitle ?? ''}`,
+              duration,
+              providerTimeline,
+            }
           : null
-
-      const seasonText =
-        !titleSeason && 2 <= seasonNum && seasonNum !== seasonNumVague
-          ? `第${seasonNum}期`
-          : null
-      const workTitle =
-        [title, seasonText].filter(Boolean).join(' ').trim() || null
-
-      const episodeText =
-        !subtitleEpisode && 0 <= episodeNum ? `第${episodeNum}話` : null
-      const episodeTitle =
-        [episodeText, subtitle].filter(Boolean).join(' ').trim() || null
-
-      const duration = playbackUrls.fullTitleDurationMs / 1000
-
-      logger.log('workTitle', workTitle)
-      logger.log('episodeTitle', episodeTitle)
-      logger.log('duration', duration)
-
-      const providerTimeline = session.resume(
-        playbackInfo.id,
-        playbackInfo.timelineEvidence,
-        // Playback observations cover Episodes; movies retain the normal pipeline.
-        catalog.type === 'EPISODE' &&
-          !!catalog.seriesTitle &&
-          Number.isSafeInteger(catalog.seasonNumber) &&
-          Number.isSafeInteger(catalog.episodeNumber) &&
-          seasonNum >= 0 &&
-          episodeNum >= 0
-      )
-
-      return workTitle
-        ? {
-            input: `${workTitle} ${episodeTitle ?? ''}`,
-            duration,
-            providerTimeline,
-          }
-        : null
+      },
+      appendCanvas: (video, canvas) => {
+        if (patcher.nco) getSession(patcher.nco)
+        video
+          .closest('.dv-player-fullscreen')
+          ?.querySelector('.atvwebplayersdk-player-container')
+          ?.insertAdjacentElement('afterbegin', canvas)
+      },
     },
-    appendCanvas: (video, canvas) => {
-      if (patcher.nco) getSession(patcher.nco)
-      video
-        .closest('.dv-player-fullscreen')
-        ?.querySelector('.atvwebplayersdk-player-container')
-        ?.insertAdjacentElement('afterbegin', canvas)
-    },
-  })
+    { canvasDiagnostics: true }
+  )
 
   const obs_config: MutationObserverInit = {
     childList: true,

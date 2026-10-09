@@ -1,6 +1,7 @@
 import type { MarkerKey } from '@/constants/markers'
 import type { Browser } from '@/utils/webext'
 import type { NCOPatcherFunctions } from './patcher'
+import type { NcoThreadsV1Thread } from './state'
 
 import equal from 'fast-deep-equal'
 
@@ -42,6 +43,9 @@ export class NCOverlay {
   readonly #port: Browser.runtime.Port
 
   #threadRevision = 0
+  #clearing = 0
+  #disposed = false
+  #renderedThreads: NcoThreadsV1Thread[] | null = null
 
   get video() {
     return this.renderer.video
@@ -85,12 +89,15 @@ export class NCOverlay {
   }
 
   async dispose() {
+    if (this.#disposed) return
+    this.#disposed = true
     logger.log('NCOverlay.dispose()')
 
     this.#threadRevision++
+    this.renderer.dispose()
+    this.#renderedThreads = null
     await this.state.dispose()
     this.#threadRevision++
-    this.renderer.dispose()
     this.keyboard.dispose()
 
     this.#port.disconnect()
@@ -102,12 +109,19 @@ export class NCOverlay {
   }
 
   async clear() {
+    if (this.#disposed) return
     logger.log('NCOverlay.clear()')
 
     this.#threadRevision++
-    await this.state.clear()
-    this.#threadRevision++
+    this.#clearing++
     this.renderer.clear()
+    this.#renderedThreads = null
+    try {
+      await this.state.clear()
+    } finally {
+      this.#threadRevision++
+      this.#clearing--
+    }
 
     await sendExtensionMessage('bg:setBadge', { text: null })
   }
@@ -162,14 +176,22 @@ export class NCOverlay {
   /**
    * 描画するコメントデータを更新する
    */
-  #updateRendererThreads = async () => {
+  #updateRendererThreads = () => this.#refreshRendererThreads(false)
+
+  #refreshRendererThreads = async (timelineOnly: boolean) => {
+    if (this.#disposed || this.#clearing) return
     const revision = ++this.#threadRevision
     const threads = await this.state.getThreads()
 
-    if (revision !== this.#threadRevision) return
+    if (this.#disposed || this.#clearing || revision !== this.#threadRevision)
+      return
+    // Timeline duration/pending evidence may change without changing displayed
+    // comments. Do not create/destroy GPU surfaces for an identical result.
+    if (timelineOnly && equal(threads, this.#renderedThreads)) return
 
     this.renderer.setThreads(threads)
     this.renderer.reload()
+    this.#renderedThreads = threads
   }
 
   /**
@@ -269,7 +291,7 @@ export class NCOverlay {
       // Provider timeline changes also refresh manually added eligible slots.
       this.state.onChange('info', (newValue, oldValue) => {
         if (!equal(newValue?.providerTimeline, oldValue?.providerTimeline)) {
-          this.#updateRendererThreads()
+          this.#refreshRendererThreads(true)
         }
       }),
 
