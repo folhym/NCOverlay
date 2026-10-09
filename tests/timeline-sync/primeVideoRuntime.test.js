@@ -604,17 +604,18 @@ if (preallocation) {
     episode = 2; await observer.callback(); await flush()
     if (mode === 'context-aba') {
       episode = 1; await observer.callback(); await flush()
+      delayedReply = null // Recovery must fetch a new response, not replay the old one.
       release(); await oldLoad; await flush()
-      assert.equal((await info()).providerTimeline, undefined, 'ABA alone must invalidate the old request')
-      assert.equal(selectedVideo.durationListeners.size, 0)
-      assert.ok(errors.some(error => /Stale Prime/.test(error)))
+      assert.equal((await info()).providerTimeline, undefined, 'Old confirmed alignments must not survive ABA')
+      assert.equal(selectedVideo.durationListeners.size, 1)
+      assert.ok(logs.some(([event,data])=>event==='primeVideo.getInfo'&&data.stage==='retry'&&data.failure==='session-invalidated'))
     }
     delayedReply = null; selectedVideo.duration = episode === 1 ? 1425 : 1426; selectedVideo.currentTime = 0
     await load('reload')
     const accepted = await info()
     if (mode !== 'context-aba') { release(); await oldLoad; await flush() }
     assert.deepEqual(await info(), accepted)
-    assert.ok(errors.some(error => /Stale Prime/.test(error)))
+    assert.ok(logs.some(([event,data])=>event==='primeVideo.getInfo'&&data.stage===(mode==='context-aba'?'retry':'cancelled')))
   } else if (mode === 'precommit-duration') {
     const playing = await init.getInfo(patcher.nco, {})
     await change(1506.372, 1148.940833)
@@ -640,7 +641,7 @@ for (const [event, payload] of logs) {
     assert.ok(!JSON.stringify(payload).includes('https:'))
   }
 }
-if (!['late-response', 'context-aba'].includes(mode)) assert.deepEqual(errors, [])
+assert.deepEqual(errors, [])
 const last = selectedVideo
 await patcher.dispose(); await flush()
 assert.equal(last.durationListeners.size, 0)

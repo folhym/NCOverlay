@@ -226,7 +226,11 @@ async function stateFromPlayingInfo(
   expect(appendCanvas).toHaveBeenCalledWith(video, overlay.canvas)
   await overlay.dispatch('loadedmetadata')
   expect(getInfo).toHaveBeenCalledTimes(1)
-  expect(getInfo).toHaveBeenCalledWith(overlay, {})
+  expect(getInfo).toHaveBeenCalledWith(
+    overlay,
+    expect.objectContaining({ isOwnerCurrent: expect.any(Function) })
+  )
+  expect(getInfo.mock.calls[0][1].isOwnerCurrent()).toBe(true)
   expect((await overlay.state.get('info')).providerTimeline).toEqual(timeline)
   expect((await overlay.state.get('info')).duration).toBe(
     Math.floor(durationSeconds)

@@ -7,7 +7,7 @@ const probe = String.raw`
 import assert from 'node:assert/strict'
 import { mock } from 'bun:test'
 const mode = process.argv.at(-1)
-const raf = new Map(), engines = [], destroyed = [], logs = [], stored = new Map(), listeners = new Map()
+const raf = new Map(), engines = [], destroyed = [], logs = [], stored = new Map(), listeners = new Map(),messages=new Map()
 let nextFrame = 0, clock = 0, fallback = false
 const flush = async () => { for (let i=0;i<150;i++) await Promise.resolve() }
 const deferred = () => { let resolve,reject; const promise = new Promise((r,j) => { resolve=r;reject=j }); return { promise, resolve, reject } }
@@ -72,7 +72,7 @@ class Nico {
 mock.module('@xpadev-net/niconicomments',()=>({default:Nico}))
 mock.module('@/utils/logger',()=>({logger:{log(...a){logs.push(a)},error(){}}}))
 mock.module('@/utils/webext',()=>({webext:{runtime:{connect(){return {onMessage:{addListener(){}},disconnect(){}}}}}}))
-mock.module('@/messaging/extension',()=>({async sendExtensionMessage(name){return name==='bg:getCurrentTab'?{id:1}:null},onExtensionMessage(){return()=>{}}}))
+mock.module('@/messaging/extension',()=>({async sendExtensionMessage(name){return name==='bg:getCurrentTab'?{id:1}:null},onExtensionMessage(name,callback){messages.set(name,callback);return()=>{if(messages.get(name)===callback)messages.delete(name)}}}))
 mock.module('@/ncoverlay/keyboard',()=>({NCOKeyboard:class {dispose(){}}}))
 if(!mode.startsWith('load-')) mock.module('@/ncoverlay/searcher',()=>({NCOSearcher:class {async cancel(){} async autoSearch(){}}}))
 else {
@@ -116,7 +116,82 @@ if(mode.startsWith('load-')) {
   async threads(response){return {threads:[{...threads[0],id:response.data.video.id}]}}
  }}}))
  const {storage}=await import('./src/utils/storage/extension.ts')
- const patcher=new NCOPatcher('primeVideo',{
+ let patcher
+ if(mode.startsWith('load-prime-')) {
+  let observer,secondWait=false,recoveryCanvas,reads=0,stable=true
+  mock.module('#imports',()=>({defineContentScript:config=>config}))
+  mock.module('@/utils/extension/checkVodEnable',()=>({async checkVodEnable(){return true}}))
+  mock.module('@/utils/sleep',()=>({async sleep(){if(secondWait){secondWait=false;episode=2;await observer.callback();recoveryCanvas=patcher.nco.canvas}}}))
+  const {extractPrimeTimelineEvidence}=await import('./src/timeline-sync/providers/primeVideo.ts')
+  mock.module('@/messaging/page',()=>({async sendPageMessage(){
+   reads++
+   if(episode===2) {
+    if(!stable)return null
+    if(reads===2&&mode==='load-prime-message')throw new Error('PRIVATE-PAGE-ERROR')
+    if(reads===2&&mode==='load-prime-missing')return null
+    if(reads===2&&mode==='load-prime-incomplete')return {id:'PRIVATE-ID',catalog:{title:'PRIVATE-TITLE'}}
+   }
+   const playbackUrls={fullTitleDurationMs:episode===1?1425000:1426000,intraTitlePlaylist:[{type:'Main',startMs:0,endMs:400000},{type:'Remote'},{type:'Main',startMs:400000,endMs:episode===1?1425000:1426000}]}
+   return {id:'PRIVATE-EPISODE-ID-'+episode,playbackUrls,catalog:{type:'EPISODE',seriesTitle:'PRIVATE-SERIES',title:'PRIVATE-EPISODE-'+episode,seasonNumber:1,episodeNumber:episode},timelineEvidence:extractPrimeTimelineEvidence({vodPlaylistedPlaybackUrls:{result:{playbackUrls}}})}
+  }}))
+  globalThis.location={pathname:'/private-path'}
+  document.body.querySelector=selector=>selector.includes('video[src]')?video:{textContent:selector.includes('title-text:')?'PRIVATE-SERIES':'S1 E'+episode+' PRIVATE-EPISODE-'+episode}
+  video.closest=()=>({querySelector(){return {insertAdjacentElement(_where,canvas){document.body.append(canvas)}}}})
+  video.checkVisibility=()=>true
+  globalThis.MutationObserver=class {constructor(callback){observer=this;this.callback=callback}observe(){}disconnect(){}}
+  const ready=deferred()
+  mock.module('@/ncoverlay/patcher',()=>({NCOPatcher:class extends NCOPatcher {constructor(...args){super(...args);patcher=this;ready.resolve()}}}))
+  const {default:script}=await import('./src/entrypoints/vod-primeVideo.content/index.ts')
+  script.main();await ready.promise;await patcher.setVideo(video)
+  // loadedmetadata for B precedes the visible labels; update them inside the
+  // real getInfo's settle wait, invoking the real observer/context guard.
+  video.dispatchEvent(new Event('loadedmetadata'));await flush()
+  for(const request of requests)request.resolve(watch(request.id));await flush()
+  assert.equal((await patcher.nco.state.get('slotDetails')).every(v=>v.status==='ready'),true)
+  const old=patcher.nco.canvas
+  const count=engines.length
+  if(mode==='load-prime-context')secondWait=true
+  else if(mode.startsWith('load-prime-commit')) {
+   const set=storage.set;let flips=0
+   storage.set=async(key,value)=>{
+    if(key.endsWith(':info')&&value?.input&&flips<(mode==='load-prime-commit-limit'?3:1)) {
+     flips++;episode++;await observer.callback()
+    }
+    return set(key,value)
+   }
+  }
+  else {episode=2;await observer.callback()}
+  if(mode==='load-prime-write-error') {
+   const set=storage.set;let fail=true
+   storage.set=async(key,value)=>{if(fail&&key.endsWith(':info')&&value?.input){fail=false;throw new Error('PRIVATE-STORAGE-ERROR')}return set(key,value)}
+  }
+  if(mode==='load-prime-exhausted')stable=false
+  clock+=2000;video.duration=1426;video.currentTime=0
+  video.dispatchEvent(new Event('loadedmetadata'));await flush()
+  assert.equal(old.isConnected,false)
+  assert.equal(engines.length,count,'Metadata retries must not recreate drawing backends')
+  if(recoveryCanvas)assert.equal(patcher.nco.canvas,recoveryCanvas)
+  if(mode==='load-prime-exhausted') {
+   assert.equal(reads,4,'One initial request and three bounded failed attempts')
+   assert.equal(await patcher.nco.state.get('info'),null)
+   assert.equal(await patcher.nco.state.get('slotDetails'),null)
+   assert.ok(logs.some(([event,data])=>event==='primeVideo.getInfo'&&data.stage==='exhausted'))
+   stable=true
+   messages.get('content:reload')();await flush()
+  }
+  if(mode==='load-prime-commit-limit') {
+   assert.equal(reads,4,'Commit guard retries share the same three-attempt budget')
+   assert.equal(await patcher.nco.state.get('info'),null)
+   assert.equal(await patcher.nco.state.get('slotDetails'),null)
+   messages.get('content:reload')();await flush()
+  }
+  if(mode==='load-prime-write-error') {
+   assert.ok(logs.some(([event,data])=>event==='nco.commentPipeline'&&data.event==='getInfo.error'&&data.failurePhase==='commit'))
+   assert.equal(await patcher.nco.state.get('slotDetails'),null)
+   messages.get('content:reload')();await flush()
+  }
+  assert.equal(requests.filter(r=>r.id.startsWith('so1')).length,2,'Stale info must never start another Episode A search')
+ } else patcher=new NCOPatcher('primeVideo',{
   async getInfo(owner){const selected=episode;if(mode==='load-info-stale'&&selected===1)await metadata.promise;
    if(mode==='load-loaded-id') {
     await owner.state.set('slots',[{id:'so11',threads,isAutoLoaded:false}])
@@ -131,7 +206,7 @@ if(mode.startsWith('load-')) {
   const set=storage.set;let block=true
   storage.set=async(key,value)=>{if(block&&key.endsWith(':slotDetails')&&value?.some(v=>v.status==='loading')){block=false;await writeGate.promise}return set(key,value)}
  }
- video.dispatchEvent(new Event('loadedmetadata'));await flush()
+ if(!mode.startsWith('load-prime-')){video.dispatchEvent(new Event('loadedmetadata'));await flush()}
  if(mode==='load-info-stale') {
   episode=2;clock+=2000;video.dispatchEvent(new Event('loadedmetadata'));await flush();metadata.resolve();await flush()
  } else if(mode==='load-stale'||mode==='load-write-drain') {
@@ -151,8 +226,9 @@ if(mode.startsWith('load-')) {
  if(mode!=='load-dispose') {
   const current=patcher.nco
   const details=await current.state.get('slotDetails')
+  assert.ok(details,'Metadata recovery failed: '+JSON.stringify(logs.filter(([event])=>event==='nco.commentPipeline')))
   assert.equal(details.filter(v=>v.status==='loading').length,2)
-  if(episode===2)assert.equal(details.every(v=>v.id.startsWith('so2')),true)
+  if(episode>1)assert.equal(details.every(v=>v.id.startsWith('so'+episode)),true)
   for(const request of requests) {
    if(mode==='load-error'&&request.id.endsWith('1'))request.reject(new Error('PRIVATE-API-ERROR'))
    else request.resolve(watch(request.id))
@@ -164,7 +240,7 @@ if(mode.startsWith('load-')) {
   assert.equal(loaded.filter(v=>v.status==='ready').length,expected)
   assert.equal(slots.length,expected)
   assert.equal(loaded.filter(v=>v.status==='error').length,mode==='load-error'?1:0)
-  if(episode===2)assert.equal(slots.every(v=>v.id.startsWith('so2')),true)
+  if(episode>1)assert.equal(slots.every(v=>v.id.startsWith('so'+episode)),true)
   assert.equal(await current.state.get('status'),'ready');assert.equal(canvases().length,1)
   assert.equal(engines.at(-1).threads.length,slots.length)
   assert.equal(loaded.filter(v=>v.status==='ready'&&v.isAutoLoaded).every(v=>v.info.thumbnail==='fixture-thumb'),true)
@@ -257,7 +333,7 @@ if(mode.startsWith('load-')) {
 }
 for(const [name,evidence] of logs) if(['nco.canvasLifecycle','nco.commentPipeline','nco.commentLoad','nco.rendererThreads'].includes(name)) {
  assert.ok(!JSON.stringify(evidence).includes('PRIVATE-'))
- for(const [key,value] of Object.entries(evidence)) if(key!=='event')assert.ok(value===null||typeof value==='boolean'||(typeof value==='number'&&Number.isFinite(value)),key)
+ for(const [key,value] of Object.entries(evidence)) if(key==='failurePhase')assert.ok(['provider','parse','commit',null].includes(value));else if(key!=='event')assert.ok(value===null||typeof value==='boolean'||(typeof value==='number'&&Number.isFinite(value)),key)
 }
 console.log('renderer-pass:'+mode)
 `
@@ -286,6 +362,14 @@ describe('renderer canvas lifecycle with browser boundary fixtures', () => {
     'load-error',
     'load-loaded-id',
     'load-iterator',
+    'load-prime-context',
+    'load-prime-message',
+    'load-prime-missing',
+    'load-prime-incomplete',
+    'load-prime-exhausted',
+    'load-prime-commit',
+    'load-prime-commit-limit',
+    'load-prime-write-error',
   ]) {
     test(mode, () => {
       const result = Bun.spawnSync({

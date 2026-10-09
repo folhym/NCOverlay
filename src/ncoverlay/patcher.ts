@@ -38,6 +38,12 @@ export interface NCOPatcherInit {
 }
 
 export interface NCOPatcherInfoRequest {
+  /** Owner/metadata generation; providers may stop bounded retries on cancellation. */
+  isOwnerCurrent?: () => boolean
+  /** Provider already emitted a sanitized classification; omit exception payload. */
+  failureLogged?: boolean
+  /** Provider may authorize a fresh read if its lease expired before info commit. */
+  retryOnStale?: () => boolean
   /** Optional provider check immediately before committing even a null result. */
   isCurrent?: () => boolean
 }
@@ -123,13 +129,18 @@ export class NCOPatcher {
       pendingWrite = result.catch(() => {})
       return result
     }
-    const trace = (event: string, generation: number) => {
+    const trace = (
+      event: string,
+      generation: number,
+      failurePhase: 'provider' | 'parse' | 'commit' | null = null
+    ) => {
       if (this.#functions?.pipelineDiagnostics) {
         logger.log('nco.commentPipeline', {
           event,
           ownerGeneration,
           generation,
           current: isCurrent(generation),
+          failurePhase,
         })
       }
     }
@@ -137,14 +148,31 @@ export class NCOPatcher {
     this.#nco.state.set('vod', this.#vod)
     this.#nco.state.set('fileDetail', fileDetail)
 
-    const loadInfo = async (generation: number) => {
+    const loadInfo = async (
+      generation: number,
+      request: NCOPatcherInfoRequest = {
+        isOwnerCurrent: () => isCurrent(generation),
+      },
+      commitAttempt = 0
+    ): Promise<boolean> => {
       if (!isCurrent(generation)) return false
       trace('getInfo.start', generation)
 
       logger.log('NCOPatcher.setVideo > loadInfo()')
 
+      const retry = () => {
+        if (
+          isCurrent(generation) &&
+          commitAttempt < 2 &&
+          request.retryOnStale?.()
+        ) {
+          trace('getInfo.retry', generation)
+          return loadInfo(generation, request, commitAttempt + 1)
+        }
+        return false
+      }
+      let failurePhase: 'provider' | 'parse' | 'commit' = 'provider'
       try {
-        const request: NCOPatcherInfoRequest = {}
         const info = await this.#init.getInfo(nco, request)
 
         if (
@@ -152,9 +180,10 @@ export class NCOPatcher {
           (request.isCurrent && !request.isCurrent())
         ) {
           trace('getInfo.stale', generation)
-          return false
+          return retry()
         }
 
+        failurePhase = 'parse'
         let parsed: ParsedResult | undefined
 
         if (info) {
@@ -184,6 +213,7 @@ export class NCOPatcher {
           isNhkOndemand: info?.isNhkOndemand,
         }
 
+        failurePhase = 'commit'
         let accepted = false
         await write(generation, () => {
           if (request.isCurrent && !request.isCurrent())
@@ -191,14 +221,27 @@ export class NCOPatcher {
           accepted = true
           return nco.state.set('info', args)
         })
-        if (!accepted || !isCurrent(generation)) return false
+        if (
+          !accepted ||
+          !isCurrent(generation) ||
+          (request.isCurrent && !request.isCurrent())
+        ) {
+          trace('getInfo.stale', generation)
+          if (accepted && isCurrent(generation)) {
+            // A context can change while the already dispatched storage write
+            // completes. Do not search from that stale info while recovering.
+            await write(generation, () => nco.state.remove('info'))
+          }
+          return retry()
+        }
         trace('getInfo.accepted', generation)
 
         logger.log('state.info', args)
         return true
       } catch (err) {
-        trace('getInfo.error', generation)
-        logger.error('NCOPatcher.setVideo > loadInfo()', err)
+        trace('getInfo.error', generation, failurePhase)
+        if (!request.failureLogged && !this.#functions?.pipelineDiagnostics)
+          logger.error('NCOPatcher.setVideo > loadInfo()', err)
         return false
       }
     }

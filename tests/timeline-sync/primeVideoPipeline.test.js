@@ -145,15 +145,21 @@ const overlay = { video, async clear() {}, async dispose() {}, state: {
   async get() { return null }, async set() {}, onChange() { return () => {} },
 } }
 patcher.nco = overlay
-const info = await init.getInfo(overlay, {})
+const request = {}
+let info, failure
+try { info = await init.getInfo(overlay, request) } catch (error) { failure = error }
 const diagnosticLogs = logs.filter(([event]) => event === 'primeVideo.timelineEvidence')
 if (mode === 'eviction') {
-  assert.equal(info, null)
+  assert.ok(failure)
+  assert.equal(request.failureLogged, true)
+  assert.equal(request.isCurrent(), false)
+  assert.equal(logs.filter(([event,data])=>event==='primeVideo.getInfo'&&data.stage==='exhausted'&&data.failure==='metadata-missing').length,1)
   assert.equal(diagnosticLogs.length, 1)
   assert.equal(diagnosticLogs[0][1].status, 'resource-unavailable')
   assert.equal(diagnosticLogs[0][1].fullTitleDurationMs, null)
   assert.deepEqual(diagnosticLogs[0][1].transitionEvents, [])
 } else {
+  assert.equal(failure, undefined)
   assert.equal(info.duration, mode === 'identity' ? 1600 : 1440)
   assert.ok(info.input.includes(titleElem.textContent))
   assert.equal(info.providerTimeline, undefined)
