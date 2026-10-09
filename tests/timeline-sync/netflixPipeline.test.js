@@ -73,6 +73,7 @@ class OverlayFixture {
   constructor(id, video) {
     this.id = id; this.video = video; this.canvas = {}
     this.state = new NCOState(id)
+    this.searcher = { async cancel() {} }
     this.listeners = new Map()
   }
   addEventListener(event, callback) {

@@ -73,6 +73,7 @@ mock.module('@/messaging/extension', () => ({
 }))
 mock.module('@/ncoverlay/keyboard', () => ({ NCOKeyboard: class { dispose() {} } }))
 mock.module('@/ncoverlay/searcher', () => ({ NCOSearcher: class {
+  async cancel() {}
   async autoSearch(args) { searches++; assert.deepEqual(args.targets, ['official', 'danime', 'chapter']) }
 } }))
 mock.module('@/ncoverlay/renderer', () => ({ NCORenderer: class {

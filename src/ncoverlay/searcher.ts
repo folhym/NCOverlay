@@ -51,13 +51,47 @@ export interface NCOSearcherAutoSearchArgs {
  * NCOverlayの検索担当
  */
 export class NCOSearcher {
+  static #nextOwner = 0
+  readonly #owner = ++NCOSearcher.#nextOwner
   readonly #state: NCOState
+  readonly #diagnostics: boolean
+  #generation = 0
+  #pendingWrite: Promise<unknown> = Promise.resolve()
 
-  constructor(state: NCOState) {
+  constructor(state: NCOState, diagnostics = false) {
     this.#state = state
+    this.#diagnostics = diagnostics
+  }
+
+  /** Stop stale search/API results and drain state writes before cleanup. */
+  cancel() {
+    this.#generation++
+    return this.#pendingWrite
+  }
+
+  #trace(event: string, generation: number, count = 0) {
+    if (this.#diagnostics) {
+      logger.log('nco.commentLoad', {
+        event,
+        owner: this.#owner,
+        generation,
+        current: generation === this.#generation,
+        count,
+      })
+    }
   }
 
   async autoSearch(args: NCOSearcherAutoSearchArgs) {
+    const generation = ++this.#generation
+    const isCurrent = () => generation === this.#generation
+    const write = async (task: () => Promise<unknown>) => {
+      const result = this.#pendingWrite.then(() =>
+        isCurrent() ? task() : undefined
+      )
+      this.#pendingWrite = result.catch(() => {})
+      await result
+      return isCurrent()
+    }
     const targets: AutoSearchTarget[] = filterAutomaticSearchTargets(
       args.targets
     )
@@ -75,8 +109,10 @@ export class NCOSearcher {
 
     // 読み込み済みのスロットID
     const slotDetails = await this.#state.get('slotDetails')
+    if (!isCurrent()) return
     const loadedIds = slotDetails?.map((v) => v.id) ?? []
 
+    this.#trace('candidates.request', generation)
     const [searchNiconicoResults, searchSyobocalResults, searchNicologResult] =
       await Promise.all([
         // ニコニコ動画 検索
@@ -104,6 +140,10 @@ export class NCOSearcher {
         // nicolog 検索
         targets.includes('nicolog') ? ncoSearchProxy.nicolog(input) : null,
       ])
+    if (!isCurrent()) {
+      this.#trace('candidates.stale', generation)
+      return
+    }
 
     logger.log('searchNiconicoResults', searchNiconicoResults)
     logger.log('searchSyobocalResults', searchSyobocalResults)
@@ -209,10 +249,36 @@ export class NCOSearcher {
       (v) => [...v.values()]
     )
 
-    await this.#state.add('slotDetails', ...loadingSlotDetailsArray)
+    if (
+      !(await write(() =>
+        this.#state.add('slotDetails', ...loadingSlotDetailsArray)
+      ))
+    )
+      return
+    this.#trace(
+      'candidates.loading',
+      generation,
+      loadingSlotDetailsArray.length
+    )
 
     // コメント取得
-    await this.#state.set('status', 'loading')
+    if (!(await write(() => this.#state.set('status', 'loading')))) return
+
+    // An individual source failure must reach error, not strand all candidates
+    // in loading. Ordinals/stages only; never log IDs, URLs or API payloads here.
+    let requestIndex = 0
+    const loadComment = async (id: string) => {
+      const index = ++requestIndex
+      this.#trace('comment.start', generation, index)
+      try {
+        return await getNiconicoComment(id, undefined, (stage) => {
+          this.#trace(`comment.${stage}`, generation, index)
+        })
+      } catch {
+        this.#trace('comment.error', generation, index)
+        return null
+      }
+    }
 
     const jikkyoIds = [...loadingSlotDetails.jikkyo.values()].map((v) => v.id)
 
@@ -230,25 +296,25 @@ export class NCOSearcher {
     ] = await Promise.all([
       // ニコニコ動画 コメント 取得
       Promise.all(
-        loadingSlotDetails.official.values().map((detail) => {
-          return getNiconicoComment(detail.id)
+        [...loadingSlotDetails.official.values()].map((detail) => {
+          return loadComment(detail.id)
         })
       ),
       Promise.all(
-        loadingSlotDetails.danime.values().map((detail) => {
-          return getNiconicoComment(detail.id)
+        [...loadingSlotDetails.danime.values()].map((detail) => {
+          return loadComment(detail.id)
         })
       ),
       Promise.all(
         (targets.includes('chapter') ? searchNiconicoResults.chapter : []).map(
           (data) => {
-            return getNiconicoComment(data.contentId)
+            return loadComment(data.contentId)
           }
         )
       ),
       Promise.all(
-        loadingSlotDetails.szbh.values().map((detail) => {
-          return getNiconicoComment(detail.id)
+        [...loadingSlotDetails.szbh.values()].map((detail) => {
+          return loadComment(detail.id)
         })
       ),
 
@@ -265,11 +331,16 @@ export class NCOSearcher {
 
       // nicolog 取得
       Promise.all(
-        loadingSlotDetails.nicolog.values().map((detail) => {
+        [...loadingSlotDetails.nicolog.values()].map((detail) => {
           return getNicologComment(`${NICO_LIVE_ANIME_ROOT}/${detail.id}`)
         })
       ),
     ])
+    if (!isCurrent()) {
+      this.#trace('comments.stale', generation)
+      return
+    }
+    this.#trace('comments.received', generation, requestIndex)
 
     logger.log('commentsOfficial', commentsOfficial)
     logger.log('commentsDAnime', commentsDAnime)
@@ -327,9 +398,24 @@ export class NCOSearcher {
       }
     }
 
-    addLoadedSlots(searchNiconicoResults.official, commentsOfficial)
-    addLoadedSlots(searchNiconicoResults.danime, commentsDAnime)
-    addLoadedSlots(searchNiconicoResults.szbh, commentsSzbh)
+    addLoadedSlots(
+      searchNiconicoResults.official.filter((data) =>
+        loadingSlotDetails.official.has(data.contentId)
+      ),
+      commentsOfficial
+    )
+    addLoadedSlots(
+      searchNiconicoResults.danime.filter((data) =>
+        loadingSlotDetails.danime.has(data.contentId)
+      ),
+      commentsDAnime
+    )
+    addLoadedSlots(
+      searchNiconicoResults.szbh.filter((data) =>
+        loadingSlotDetails.szbh.has(data.contentId)
+      ),
+      commentsSzbh
+    )
 
     // dアニメ(分割)
     if (commentsChapter[0] && commentsChapter.every((v) => v !== null)) {
@@ -464,17 +550,30 @@ export class NCOSearcher {
       if (slot && detail) {
         slots.push(slot)
 
-        await this.#state.update('slotDetails', ['id'], detail)
+        if (
+          !(await write(() =>
+            this.#state.update('slotDetails', ['id'], detail)
+          ))
+        )
+          return
+        this.#trace('slot.ready', generation)
       } else {
-        await this.#state.update('slotDetails', ['id'], {
-          id,
-          status: 'error',
-        })
+        if (
+          !(await write(() =>
+            this.#state.update('slotDetails', ['id'], {
+              id,
+              status: 'error',
+            })
+          ))
+        )
+          return
+        this.#trace('slot.error', generation)
         // await this.#state.remove('slotDetails', { id })
       }
     }
 
-    await this.#state.add('slots', ...slots)
+    if (!(await write(() => this.#state.add('slots', ...slots)))) return
+    this.#trace('slots.accepted', generation, slots.length)
 
     this.#state.get('slots').then((val) => {
       logger.log('slots', val)

@@ -10,7 +10,7 @@ const mode = process.argv.at(-1)
 const raf = new Map(), engines = [], destroyed = [], logs = [], stored = new Map(), listeners = new Map()
 let nextFrame = 0, clock = 0, fallback = false
 const flush = async () => { for (let i=0;i<150;i++) await Promise.resolve() }
-const deferred = () => { let resolve; const promise = new Promise(r => { resolve=r }); return { promise, resolve } }
+const deferred = () => { let resolve,reject; const promise = new Promise((r,j) => { resolve=r;reject=j }); return { promise, resolve, reject } }
 class Classes {
   values = new Set()
   add(...names) { names.forEach(n => this.values.add(n)) }
@@ -49,6 +49,7 @@ globalThis.document = new Doc()
 globalThis.window = { devicePixelRatio:1 }
 globalThis.HTMLCanvasElement=Canvas
 globalThis.HTMLMediaElement={ HAVE_METADATA:1 }
+globalThis.EXT_USER_AGENT='fixture'
 globalThis.performance={ now() { return clock } }
 globalThis.requestAnimationFrame=callback=>{const id=++nextFrame;raf.set(id,callback);return id}
 globalThis.cancelAnimationFrame=id=>raf.delete(id)
@@ -73,11 +74,16 @@ mock.module('@/utils/logger',()=>({logger:{log(...a){logs.push(a)},error(){}}}))
 mock.module('@/utils/webext',()=>({webext:{runtime:{connect(){return {onMessage:{addListener(){}},disconnect(){}}}}}}))
 mock.module('@/messaging/extension',()=>({async sendExtensionMessage(name){return name==='bg:getCurrentTab'?{id:1}:null},onExtensionMessage(){return()=>{}}}))
 mock.module('@/ncoverlay/keyboard',()=>({NCOKeyboard:class {dispose(){}}}))
-mock.module('@/ncoverlay/searcher',()=>({NCOSearcher:class {async autoSearch(){}}}))
+if(!mode.startsWith('load-')) mock.module('@/ncoverlay/searcher',()=>({NCOSearcher:class {async cancel(){} async autoSearch(){}}}))
+else {
+ mock.module('@/proxy/nco-utils/search/extension',()=>({ncoSearchProxy:{}}))
+ mock.module('@/proxy/nco-utils/api/extension',()=>({ncoApiProxy:{}}))
+}
 const settingsValues={
   'comment:speed':1,'comment:customize':{},'comment:hideAssistedComments':false,'comment:adjustJikkyoOffset':false,
   'autoSearch:jikkyoOnlyAdjustable':false,'ng:sharingLevel':'none','autoSearch:manual':true,
   'autoSearch:targets':[],'autoSearch:jikkyoChannelIds':[],'autoSearch:jikkyoIgnoreRerun':false,
+  'comment:useNiconicoCredentials':false,'comment:amount':1,
 }
 const initialWatches=[]
 mock.module('@/utils/settings/extension',()=>({settings:{async get(...keys){const v=keys.map(k=>{assert.ok(k in settingsValues,k);return settingsValues[k]});return keys.length===1?v[0]:v},onChange(){return()=>{}},watch(key,callback){initialWatches.push([key,callback]);return()=>{}}}}))
@@ -98,7 +104,76 @@ async function seed(state) {
 }
 const timeline=adjustment=>({alignments:[{sourceTimeMs:0,targetTimeMs:0,reason:'start'},{sourceTimeMs:100000,targetTimeMs:100000+adjustment,reason:'break'}],durationMs:1425000+adjustment})
 async function update(nco,adjustment,duration) { const old=await nco.state.get('info');await nco.state.set('info',{...old,providerTimeline:{...timeline(adjustment),durationMs:duration??1425000+adjustment}});await flush() }
-if(['replace','fallback','raf','terminal','alpha','capture-cleanup'].includes(mode)) {
+if(mode.startsWith('load-')) {
+ if(mode==='load-iterator')Object.defineProperty(Object.getPrototypeOf(new Map().values()),'map',{value:undefined})
+ let episode=1;const requests=[],metadata=deferred(),writeGate=deferred()
+ settingsValues['autoSearch:manual']=false;settingsValues['autoSearch:targets']=['official','danime']
+ const candidate=(id)=>({contentId:id,title:'PRIVATE-TITLE',lengthSeconds:1425,startTime:'2026-10-09',channelId:1,categoryTags:'アニメ',tags:'',thumbnailUrl:undefined,viewCounter:1,commentCounter:1})
+ mock.module('@/proxy/nco-utils/search/extension',()=>({ncoSearchProxy:{async niconico(){return {official:[candidate('so'+episode+'1'),...(mode==='load-loaded-id'?[candidate('so13')]:[])],danime:[candidate('so'+episode+'2')],chapter:[],szbh:[]}}}}))
+ const watch=id=>({type:'v4',data:{video:{id,count:{view:1,comment:1},thumbnail:{large:'fixture-thumb'},duration:1425},comment:{threads:[],ng:{}}},rawData:{comment:{nvComment:{params:{targets:[]}}}}})
+ mock.module('@/proxy/nco-utils/api/extension',()=>({ncoApiProxy:{niconico:{
+  watch(id){const gate=deferred();requests.push({id,...gate});return gate.promise},
+  async threads(response){return {threads:[{...threads[0],id:response.data.video.id}]}}
+ }}}))
+ const {storage}=await import('./src/utils/storage/extension.ts')
+ const patcher=new NCOPatcher('primeVideo',{
+  async getInfo(owner){const selected=episode;if(mode==='load-info-stale'&&selected===1)await metadata.promise;
+   if(mode==='load-loaded-id') {
+    await owner.state.set('slots',[{id:'so11',threads,isAutoLoaded:false}])
+    await owner.state.set('slotDetails',[{id:'so11',type:'official',status:'ready',isAutoLoaded:false}])
+   }
+   return {input:'Fixture #'+selected,duration:1425,providerTimeline:timeline(0)}},
+  appendCanvas(_video,canvas){document.body.append(canvas)},
+ },{canvasDiagnostics:true,pipelineDiagnostics:true})
+ await patcher.setVideo(video)
+ const nco=patcher.nco
+ if(mode==='load-write-drain') {
+  const set=storage.set;let block=true
+  storage.set=async(key,value)=>{if(block&&key.endsWith(':slotDetails')&&value?.some(v=>v.status==='loading')){block=false;await writeGate.promise}return set(key,value)}
+ }
+ video.dispatchEvent(new Event('loadedmetadata'));await flush()
+ if(mode==='load-info-stale') {
+  episode=2;clock+=2000;video.dispatchEvent(new Event('loadedmetadata'));await flush();metadata.resolve();await flush()
+ } else if(mode==='load-stale'||mode==='load-write-drain') {
+  episode=2;clock+=2000;video.dispatchEvent(new Event('loadedmetadata'));await flush()
+  if(mode==='load-write-drain'){writeGate.resolve();await flush()}
+ } else if(mode==='load-episode') {
+  assert.equal((await nco.state.get('slotDetails')).every(v=>v.status==='loading'),true)
+  for(const request of requests)request.resolve(watch(request.id));await flush()
+  assert.equal((await nco.state.get('slotDetails')).every(v=>v.status==='ready'),true)
+  const old=nco.canvas;episode=2;clock+=2000;video.dispatchEvent(new Event('loadedmetadata'));await flush();assert.equal(old.isConnected,false)
+ } else if(mode==='load-dispose') {
+  await patcher.dispose();for(const request of requests)request.resolve(watch(request.id));await flush()
+  assert.equal(await nco.state.get('slots'),null);assert.equal(await nco.state.get('slotDetails'),null);assert.equal(canvases().length,0)
+ } else if(mode==='load-video') {
+  episode=2;const next=new Video();document.body.append(next);await patcher.setVideo(next);next.dispatchEvent(new Event('loadedmetadata'));await flush()
+ }
+ if(mode!=='load-dispose') {
+  const current=patcher.nco
+  const details=await current.state.get('slotDetails')
+  assert.equal(details.filter(v=>v.status==='loading').length,2)
+  if(episode===2)assert.equal(details.every(v=>v.id.startsWith('so2')),true)
+  for(const request of requests) {
+   if(mode==='load-error'&&request.id.endsWith('1'))request.reject(new Error('PRIVATE-API-ERROR'))
+   else request.resolve(watch(request.id))
+  }
+  await flush()
+  const loaded=await current.state.get('slotDetails'),slots=await current.state.get('slots')
+  assert.equal(loaded.filter(v=>v.status==='loading').length,0)
+  const expected=mode==='load-error'?1:mode==='load-loaded-id'?3:2
+  assert.equal(loaded.filter(v=>v.status==='ready').length,expected)
+  assert.equal(slots.length,expected)
+  assert.equal(loaded.filter(v=>v.status==='error').length,mode==='load-error'?1:0)
+  if(episode===2)assert.equal(slots.every(v=>v.id.startsWith('so2')),true)
+  assert.equal(await current.state.get('status'),'ready');assert.equal(canvases().length,1)
+  assert.equal(engines.at(-1).threads.length,slots.length)
+  assert.equal(loaded.filter(v=>v.status==='ready'&&v.isAutoLoaded).every(v=>v.info.thumbnail==='fixture-thumb'),true)
+  if(mode==='load-loaded-id')assert.ok(slots.find(v=>v.id==='so13').threads.every(t=>t.id==='so13'))
+  if(mode==='load-info-stale')assert.ok((await current.state.get('info')).input.input.endsWith('#2'))
+  assert.ok(logs.some(([event,payload])=>event==='nco.commentLoad'&&payload.event==='slots.accepted'))
+  await patcher.dispose()
+ }
+} else if(['replace','fallback','raf','terminal','alpha','capture-cleanup'].includes(mode)) {
  const r=renderer(),old=r.canvas
  if(mode==='replace'||mode==='fallback') {
   r.setOpacity(0.6);if(mode==='fallback')fallback=true;r.reload()
@@ -180,7 +255,7 @@ if(['replace','fallback','raf','terminal','alpha','capture-cleanup'].includes(mo
  } else throw new Error(mode)
  await patcher.dispose();await flush();assert.equal(canvases().length,0);assert.equal(raf.size,0)
 }
-for(const [name,evidence] of logs) if(name==='nco.canvasLifecycle') {
+for(const [name,evidence] of logs) if(['nco.canvasLifecycle','nco.commentPipeline','nco.commentLoad','nco.rendererThreads'].includes(name)) {
  assert.ok(!JSON.stringify(evidence).includes('PRIVATE-'))
  for(const [key,value] of Object.entries(evidence)) if(key!=='event')assert.ok(value===null||typeof value==='boolean'||(typeof value==='number'&&Number.isFinite(value)),key)
 }
@@ -202,6 +277,15 @@ describe('renderer canvas lifecycle with browser boundary fixtures', () => {
     'clear-race',
     'dispose-race',
     'video-owner',
+    'load-episode',
+    'load-stale',
+    'load-info-stale',
+    'load-write-drain',
+    'load-dispose',
+    'load-video',
+    'load-error',
+    'load-loaded-id',
+    'load-iterator',
   ]) {
     test(mode, () => {
       const result = Bun.spawnSync({

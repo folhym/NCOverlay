@@ -46,6 +46,7 @@ export class NCOverlay {
   #clearing = 0
   #disposed = false
   #renderedThreads: NcoThreadsV1Thread[] | null = null
+  #pipelineDiagnostics = false
 
   get video() {
     return this.renderer.video
@@ -60,10 +61,11 @@ export class NCOverlay {
     functions?: NCOPatcherFunctions
   ) {
     logger.log('new NCOverlay()')
+    this.#pipelineDiagnostics = functions?.pipelineDiagnostics ?? false
 
     this.id = tabId
     this.state = new NCOState(this.id)
-    this.searcher = new NCOSearcher(this.state)
+    this.searcher = new NCOSearcher(this.state, functions?.pipelineDiagnostics)
     this.renderer = new NCORenderer(video, functions)
     this.keyboard = new NCOKeyboard(this.state, {
       jumpMarker: (...args) => this.jumpMarker(...args),
@@ -96,6 +98,7 @@ export class NCOverlay {
     this.#threadRevision++
     this.renderer.dispose()
     this.#renderedThreads = null
+    await this.searcher.cancel()
     await this.state.dispose()
     this.#threadRevision++
     this.keyboard.dispose()
@@ -117,6 +120,7 @@ export class NCOverlay {
     this.renderer.clear()
     this.#renderedThreads = null
     try {
+      await this.searcher.cancel()
       await this.state.clear()
     } finally {
       this.#threadRevision++
@@ -179,12 +183,17 @@ export class NCOverlay {
   #updateRendererThreads = () => this.#refreshRendererThreads(false)
 
   #refreshRendererThreads = async (timelineOnly: boolean) => {
-    if (this.#disposed || this.#clearing) return
+    if (this.#disposed || this.#clearing) {
+      this.#traceThreads('blocked')
+      return
+    }
     const revision = ++this.#threadRevision
     const threads = await this.state.getThreads()
 
-    if (this.#disposed || this.#clearing || revision !== this.#threadRevision)
+    if (this.#disposed || this.#clearing || revision !== this.#threadRevision) {
+      this.#traceThreads('stale')
       return
+    }
     // Timeline duration/pending evidence may change without changing displayed
     // comments. Do not create/destroy GPU surfaces for an identical result.
     if (timelineOnly && equal(threads, this.#renderedThreads)) return
@@ -192,6 +201,19 @@ export class NCOverlay {
     this.renderer.setThreads(threads)
     this.renderer.reload()
     this.#renderedThreads = threads
+    this.#traceThreads('accepted', threads?.length ?? 0)
+  }
+
+  #traceThreads(event: 'blocked' | 'stale' | 'accepted', count = 0) {
+    if (this.#pipelineDiagnostics) {
+      logger.log('nco.rendererThreads', {
+        event,
+        revision: this.#threadRevision,
+        clearing: this.#clearing,
+        disposed: this.#disposed,
+        count,
+      })
+    }
   }
 
   /**

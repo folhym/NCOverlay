@@ -20,7 +20,18 @@ export interface GetNiconicoCommentResult {
  */
 export async function getNiconicoComment(
   query: string | WatchResponse,
-  when?: number
+  when?: number,
+  diagnose?: (
+    stage:
+      | 'settings'
+      | 'watch.request'
+      | 'watch.received'
+      | 'watch.empty'
+      | 'threads.request'
+      | 'threads.received'
+      | 'threads.empty'
+      | 'ready'
+  ) => void
 ): Promise<GetNiconicoCommentResult | null> {
   const [useNiconicoCredentials, _amount] = await settings.get(
     'comment:useNiconicoCredentials',
@@ -28,8 +39,10 @@ export async function getNiconicoComment(
   )
   // コメント表示量を一時的に1倍固定にする
   const amount = 1
+  diagnose?.('settings')
 
   // 動画情報取得
+  diagnose?.('watch.request')
   const watchResponse =
     typeof query === 'string'
       ? await ncoApiProxy.niconico.watch(
@@ -39,8 +52,10 @@ export async function getNiconicoComment(
       : query
 
   if (!watchResponse) {
+    diagnose?.('watch.empty')
     return null
   }
+  diagnose?.('watch.received')
 
   // 取得するコメントの種類をフィルター
   filterNvComment(watchResponse)
@@ -49,6 +64,7 @@ export async function getNiconicoComment(
 
   // コメント取得
   let threadsData: ThreadsV1.Data | null
+  diagnose?.('threads.request')
 
   // 複数回取得
   if (useNiconicoCredentials && 1 < amount) {
@@ -132,8 +148,10 @@ export async function getNiconicoComment(
   }
 
   if (!threadsData) {
+    diagnose?.('threads.empty')
     return null
   }
+  diagnose?.('threads.received')
 
   // コメントのNG設定を適用
   const threads = applyNgSettings(
@@ -149,5 +167,6 @@ export async function getNiconicoComment(
     })
     .reduce((prev, current) => prev + current, 0)
 
+  diagnose?.('ready')
   return { watchResponse, threads, kawaiiCount }
 }

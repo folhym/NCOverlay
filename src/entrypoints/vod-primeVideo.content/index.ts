@@ -157,7 +157,7 @@ async function main() {
           ?.insertAdjacentElement('afterbegin', canvas)
       },
     },
-    { canvasDiagnostics: true }
+    { canvasDiagnostics: true, pipelineDiagnostics: true }
   )
 
   const obs_config: MutationObserverInit = {
